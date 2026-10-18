@@ -14,22 +14,47 @@ std::atomic<Language> g_currentLanguage{Language::English};
 
 // Dahili sayfa CSS stilleri
 const wchar_t* kPageCss =
-    L"<style>body{margin:0;background:#f3f5fa;color:#1c2333;font-family:'Segoe UI',sans-serif}"
-    L".w{max-width:780px;margin:52px auto;padding:0 28px}h1{font-size:38px;font-weight:600;margin:0 0 6px}"
-    L".alt{color:#5c6577;margin:0 0 26px;font-size:15px}.k{background:#fff;border:1px solid #dde2ec;padding:16px 22px;margin:0 0 14px}"
-    L".k h3{margin:0 0 8px;font-size:17px}a{color:#2453cf;text-decoration:none}.u{color:#b42318}"
-    L"code{background:#e8ecf4;padding:1px 4px}.kucuk{color:#7a8294;font-size:13px}"
-    L".ara{display:flex;gap:8px;margin:0 0 22px}.ara input[name=q]{flex:1}"
-    L".izgara{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.izgara a{display:block;background:#fff;border:1px solid #dde2ec;padding:10px 12px}"
-    L".lang-bar{margin-top:12px;font-size:12px;color:#7a8294}"
-    L".lang-bar a{font-weight:bold;margin:0 4px}"
+    L"<style>"
+    L"body{margin:0;background:#f8fafc;color:#0f172a;font-family:'Segoe UI',sans-serif}"
+    L".w{max-width:840px;margin:36px auto;padding:0 24px}"
+    L".brand{display:flex;align-items:center;gap:14px;margin:0 0 16px}"
+    L".brand-icon{width:44px;height:44px;background:#1e40af;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets'}"
+    L".brand-text h1{font-size:30px;font-weight:700;margin:0;line-height:1.2;color:#0f172a}"
+    L".brand-pill{display:inline-block;font-size:11px;font-weight:700;color:#2563eb;background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:1px 8px;margin-top:2px}"
+    L".alt{color:#475569;margin:0 0 20px;font-size:14px;line-height:1.5}"
+    L".ara{display:flex;gap:10px;margin:0 0 22px}"
+    L".ara input[name=q]{flex:1;height:44px;padding:0 16px;border:1px solid #cbd5e1;border-radius:10px;font-size:15px;background:#fff}"
+    L".ara input[type=submit]{height:44px;padding:0 22px;background:#2563eb;color:#fff;border:none;border-radius:10px;font-weight:600;font-size:14px;cursor:pointer}"
+    L".izgara{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 22px}"
+    L".card{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit}"
+    L".card:hover{border-color:#93c5fd;background:#f8fafc;text-decoration:none}"
+    L".badge{width:38px;height:38px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff}"
+    L".badge-wiki{background:#202122;font-family:Georgia,serif;font-size:18px}"
+    L".badge-hn{background:#ff6600;font-family:Arial,sans-serif;font-size:16px}"
+    L".badge-cnn{background:#cc0000;font-size:11px;font-weight:800}"
+    L".badge-npr{background:#1e3a8a;font-size:12px;font-weight:700}"
+    L".badge-gh{background:#181717;font-size:13px;font-weight:700}"
+    L".badge-bbc{background:#991b1b;font-size:11px;font-weight:800}"
+    L".info{display:flex;flex-direction:column}"
+    L".title{font-size:14px;font-weight:600;color:#1e293b;line-height:1.3}"
+    L".host{font-size:12px;color:#64748b;margin-top:2px}"
+    L".k{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px;margin:0 0 18px}"
+    L".k h3{margin:0 0 14px;font-size:16px;color:#1e293b;font-weight:700}"
+    L".sec-list{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:0;padding:0;list-style:none}"
+    L".sec-item{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#334155;line-height:1.45}"
+    L".ic{font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-size:15px;margin-top:2px}"
+    L".ic-lock{color:#16a34a}.ic-block{color:#dc2626}.ic-code{color:#ea580c}.ic-dl{color:#2563eb}"
+    L".kucuk{color:#64748b;font-size:13px;line-height:1.5;margin:0 0 12px}"
+    L".lang-bar{padding-top:12px;border-top:1px solid #e2e8f0;font-size:13px;color:#64748b}"
+    L".lang-bar a{font-weight:600;color:#2563eb;margin:0 4px;text-decoration:none}"
+    L"code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:2px 6px;font-family:Consolas,monospace;font-size:13px}"
     L"</style>";
 
 // Metin Tablosu - İngilizce (Varsayılan)
 const wchar_t* const kStringsEn[] = {
     // UI & Durum çubuğu
     /* AppName */               L"merOS Shield",
-    /* SearchOrAddress */       L"Type address or search",
+    /* SearchOrAddress */       L"Search or enter web address",
     /* NewTab */               L"New Tab",
     /* Loading */               L"Loading: ",
     /* LoadingImages */         L"Loading images (%d)   ",
@@ -263,11 +288,20 @@ std::wstring GetHomePageHtml() {
     html += L"</title>";
     html += kPageCss;
     html += L"</head><body><div class=w>";
-    html += L"<h1>merOS Shield</h1><p class=alt>";
+
+    // Brand Header with native vector shield icon
+    html += L"<div class=brand>";
+    html += L"<div class=brand-icon>&#xEA18;</div>";
+    html += L"<div class=brand-text>";
+    html += L"<h1>merOS Shield</h1>";
+    html += L"<span class=brand-pill>SECURE BROWSER</span>";
+    html += L"</div></div>";
+
+    html += L"<p class=alt>";
     html += Get(StringId::HomeTagline, lang);
     html += L"</p>";
 
-    // Arama formu
+    // Search bar
     html += L"<form class=ara action='https://html.duckduckgo.com/html/' method=get>";
     html += L"<input name=q placeholder='";
     html += Get(StringId::HomeSearchPlaceholder, lang);
@@ -275,42 +309,42 @@ std::wstring GetHomePageHtml() {
     html += Get(StringId::HomeSearchButton, lang);
     html += L"'></form>";
 
-    // Hızlı linkler
+    // Speed Dial / Quick Access Cards with clean branded badges
     html += L"<div class=izgara>";
     if (isEn) {
-        html += L"<a href='https://en.wikipedia.org/'>Wikipedia</a>";
-        html += L"<a href='https://news.ycombinator.com/'>Hacker News</a>";
-        html += L"<a href='https://lite.cnn.com/'>CNN Lite</a>";
-        html += L"<a href='https://text.npr.org/'>NPR Text</a>";
-        html += L"<a href='https://github.com/'>GitHub</a>";
-        html += L"<a href='https://www.bbc.com/news'>BBC News</a>";
+        html += L"<a class=card href='https://en.wikipedia.org/'><div class='badge badge-wiki'>W</div><div class=info><span class=title>Wikipedia</span><span class=host>en.wikipedia.org</span></div></a>";
+        html += L"<a class=card href='https://news.ycombinator.com/'><div class='badge badge-hn'>Y</div><div class=info><span class=title>Hacker News</span><span class=host>news.ycombinator.com</span></div></a>";
+        html += L"<a class=card href='https://lite.cnn.com/'><div class='badge badge-cnn'>CNN</div><div class=info><span class=title>CNN Lite</span><span class=host>lite.cnn.com</span></div></a>";
+        html += L"<a class=card href='https://text.npr.org/'><div class='badge badge-npr'>npr</div><div class=info><span class=title>NPR Text</span><span class=host>text.npr.org</span></div></a>";
+        html += L"<a class=card href='https://github.com/'><div class='badge badge-gh'>GH</div><div class=info><span class=title>GitHub</span><span class=host>github.com</span></div></a>";
+        html += L"<a class=card href='https://www.bbc.com/news'><div class='badge badge-bbc'>BBC</div><div class=info><span class=title>BBC News</span><span class=host>bbc.com/news</span></div></a>";
     } else {
-        html += L"<a href='https://tr.wikipedia.org/'>Vikipedi</a>";
-        html += L"<a href='https://news.ycombinator.com/'>Hacker News</a>";
-        html += L"<a href='https://lite.cnn.com/'>CNN Lite</a>";
-        html += L"<a href='https://text.npr.org/'>NPR Text</a>";
-        html += L"<a href='https://github.com/'>GitHub</a>";
-        html += L"<a href='https://www.bbc.com/turkce'>BBC T\u00FCrk\u00E7e</a>";
+        html += L"<a class=card href='https://tr.wikipedia.org/'><div class='badge badge-wiki'>W</div><div class=info><span class=title>Vikipedi</span><span class=host>tr.wikipedia.org</span></div></a>";
+        html += L"<a class=card href='https://news.ycombinator.com/'><div class='badge badge-hn'>Y</div><div class=info><span class=title>Hacker News</span><span class=host>news.ycombinator.com</span></div></a>";
+        html += L"<a class=card href='https://lite.cnn.com/'><div class='badge badge-cnn'>CNN</div><div class=info><span class=title>CNN Lite</span><span class=host>lite.cnn.com</span></div></a>";
+        html += L"<a class=card href='https://text.npr.org/'><div class='badge badge-npr'>npr</div><div class=info><span class=title>NPR Text</span><span class=host>text.npr.org</span></div></a>";
+        html += L"<a class=card href='https://github.com/'><div class='badge badge-gh'>GH</div><div class=info><span class=title>GitHub</span><span class=host>github.com</span></div></a>";
+        html += L"<a class=card href='https://www.bbc.com/turkce'><div class='badge badge-bbc'>BBC</div><div class=info><span class=title>BBC T\u00FCrk\u00E7e</span><span class=host>bbc.com/turkce</span></div></a>";
     }
-    html += L"</div><p></p>";
+    html += L"</div>";
 
-    // Güvenlik kutusu
-    html += L"<div class=k><h3>";
+    // Security Box with vector icons
+    html += L"<div class=k><h3><span class='ic ic-lock'>&#xE72E;</span> ";
     html += Get(StringId::HomeSecurityTitle, lang);
-    html += L"</h3><ul>";
-    html += L"<li>"; html += Get(StringId::HomeSecItem1, lang); html += L"</li>";
-    html += L"<li>"; html += Get(StringId::HomeSecItem2, lang); html += L"</li>";
-    html += L"<li>"; html += Get(StringId::HomeSecItem3, lang); html += L"</li>";
-    html += L"<li>"; html += Get(StringId::HomeSecItem4, lang); html += L"</li>";
+    html += L"</h3><ul class=sec-list>";
+    html += L"<li class=sec-item><span class='ic ic-lock'>&#xE72E;</span><div>"; html += Get(StringId::HomeSecItem1, lang); html += L"</div></li>";
+    html += L"<li class=sec-item><span class='ic ic-block'>&#xE71A;</span><div>"; html += Get(StringId::HomeSecItem2, lang); html += L"</div></li>";
+    html += L"<li class=sec-item><span class='ic ic-code'>&#xE943;</span><div>"; html += Get(StringId::HomeSecItem3, lang); html += L"</div></li>";
+    html += L"<li class=sec-item><span class='ic ic-dl'>&#xE896;</span><div>"; html += Get(StringId::HomeSecItem4, lang); html += L"</div></li>";
     html += L"</ul></div>";
 
-    // Kısayollar ve Motor bilgisi
-    html += L"<p class=kucuk>";
+    // Shortcuts
+    html += L"<p class=kucuk><span class=ic>&#xE765;</span> ";
     html += Get(StringId::HomeShortcuts, lang);
     html += L"</p>";
 
-    // Dil değiştirici çubuğu (Language switcher)
-    html += L"<div class='lang-bar'>Language / Dil: ";
+    // Language switcher
+    html += L"<div class='lang-bar'><span class=ic>&#xE774;</span> Language / Dil: ";
     if (isEn) {
         html += L"<b>English (Default)</b> | <a href='about:lang?tr'>T\u00FCrk\u00E7e</a>";
     } else {

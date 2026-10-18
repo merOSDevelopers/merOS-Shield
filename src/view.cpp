@@ -280,28 +280,56 @@ void PageView::DrawItems(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, flo
         switch (d.kind) {
         case DisplayItem::Fill:
         case DisplayItem::HLine:
-            rt->FillRectangle(D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), brush);
+            if (d.radius > 0) {
+                D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), d.radius, d.radius);
+                rt->FillRoundedRectangle(rr, brush);
+            } else {
+                rt->FillRectangle(D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), brush);
+            }
             break;
         case DisplayItem::Stroke:
-            if (!snapshot && d.node >= 0 && d.node == focusNode_) { brush->SetColor(Col(0xFF2563EB)); rt->DrawRectangle(D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), brush, 2.f); }
-            else rt->DrawRectangle(D2D1::RectF(d.x + 0.5f, d.y + 0.5f, d.x + d.w - 0.5f, d.y + d.h - 0.5f), brush, 1.f);
+            if (!snapshot && d.node >= 0 && d.node == focusNode_) {
+                brush->SetColor(Col(0xFF2563EB));
+                if (d.radius > 0) {
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), d.radius, d.radius);
+                    rt->DrawRoundedRectangle(rr, brush, 2.f);
+                } else {
+                    rt->DrawRectangle(D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), brush, 2.f);
+                }
+            } else {
+                if (d.radius > 0) {
+                    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(D2D1::RectF(d.x + 0.5f, d.y + 0.5f, d.x + d.w - 0.5f, d.y + d.h - 0.5f), d.radius, d.radius);
+                    rt->DrawRoundedRectangle(rr, brush, 1.f);
+                } else {
+                    rt->DrawRectangle(D2D1::RectF(d.x + 0.5f, d.y + 0.5f, d.x + d.w - 0.5f, d.y + d.h - 0.5f), brush, 1.f);
+                }
+            }
             break;
         case DisplayItem::Image:
             if (page_.images) {
+                ID2D1Bitmap* bmp = nullptr;
+                ID2D1Bitmap* tmp = nullptr;
                 if (!snapshot) {
-                    if (ID2D1Bitmap* bmp = page_.images->Bitmap(rt, d.text))
-                        rt->DrawBitmap(bmp, D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    bmp = page_.images->Bitmap(rt, d.text);
                 } else {
                     // ekran goruntusu: gecici bitmap (onbellek ekran hedefine ait)
                     auto it = page_.images->map.find(d.text);
                     if (it != page_.images->map.end() && it->second.state == 1 && !it->second.px.empty()) {
-                        ID2D1Bitmap* tmp = nullptr;
                         D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
                         if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(it->second.w, it->second.h), it->second.px.data(), it->second.w * 4, props, &tmp))) {
-                            rt->DrawBitmap(tmp, D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                            tmp->Release();
+                            bmp = tmp;
                         }
                     }
+                }
+                if (bmp) {
+                    D2D1_RECT_F dstRect = D2D1::RectF(d.x, d.y, d.x + d.w, d.y + d.h);
+                    if (d.srcW > 0 && d.srcH > 0) {
+                        D2D1_RECT_F srcRect = D2D1::RectF(d.srcX, d.srcY, d.srcX + d.srcW, d.srcY + d.srcH);
+                        rt->DrawBitmap(bmp, dstRect, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &srcRect);
+                    } else {
+                        rt->DrawBitmap(bmp, dstRect, 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    }
+                    if (tmp) tmp->Release();
                 }
             }
             break;

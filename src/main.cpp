@@ -699,8 +699,9 @@ void ScanImages() {
         Node* n = st.back();
         st.pop_back();
         if (n->kind == Node::Elem) {
+            if (n->id >= 0 && size_t(n->id) < p.styles.size() && p.styles[size_t(n->id)].display == Style::None) continue;
             if (n->name == L"img" || (n->name == L"input" && n->Attr(L"type") && ToLower(*n->Attr(L"type")) == L"image")) {
-                if (n->id >= 0 && size_t(n->id) < p.styles.size() && p.styles[size_t(n->id)].display != Style::None) {
+                if (n->id >= 0 && size_t(n->id) < p.styles.size()) {
                     std::wstring u = p.images.UrlOf(n);
                     if (!u.empty() && !p.images.map.count(u) && p.images.map.size() < 600) {
                         p.images.map[u].state = 0;
@@ -708,7 +709,16 @@ void ScanImages() {
                     }
                 }
             }
-            if (n->id >= 0 && size_t(n->id) < p.styles.size() && p.styles[size_t(n->id)].display == Style::None) continue;
+            if (n->id >= 0 && size_t(n->id) < p.styles.size()) {
+                const auto& s = p.styles[size_t(n->id)];
+                if (!s.bgImage.empty()) {
+                    std::wstring bgUrl = StartsWith(ToLower(s.bgImage), L"data:") ? s.bgImage : ResolveUrl(p.base, s.bgImage);
+                    if (!bgUrl.empty() && !p.images.map.count(bgUrl) && p.images.map.size() < 600) {
+                        p.images.map[bgUrl].state = 0;
+                        p.imageQueue.push_back(bgUrl);
+                    }
+                }
+            }
         }
         for (auto& k : n->kids) st.push_back(k.get());
     }
@@ -1049,9 +1059,9 @@ void OnPageReady(PageState* raw) {
     SetWindowTextW(g_addr, pg.url.c_str());
     SetWindowTextW(g_frame, ((pg.title.empty() ? pg.url : pg.title) + L" — " + kAppName).c_str());
     Url u = ParseUrl(pg.url);
-    if (u.ok && u.scheme == L"about") SetWindowTextW(g_sec, L"⌂ merOS");
-    else if (pg.secure) SetWindowTextW(g_sec, L"✔ HTTPS");
-    else SetWindowTextW(g_sec, L"⚠ HTTP");
+    if (u.ok && u.scheme == L"about") SetWindowTextW(g_sec, L"\uEA18 merOS");
+    else if (pg.secure) SetWindowTextW(g_sec, L"\uE72E HTTPS");
+    else SetWindowTextW(g_sec, L"\uE7BA HTTP");
     ViewPage vp;
     vp.doc = pg.doc.get();
     vp.styles = &pg.styles;
@@ -1096,14 +1106,33 @@ void SaveScreenshot() {
 
 float Scale() { return float(GetDpiForWindow(g_frame)) / 96.f; }
 
+static bool FontExists(const wchar_t* face) {
+    bool found = false;
+    HDC dc = GetDC(nullptr);
+    LOGFONTW lf{};
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(lf.lfFaceName, face, _TRUNCATE);
+    EnumFontFamiliesExW(dc, &lf, [](const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM lp) -> int {
+        *reinterpret_cast<bool*>(lp) = true;
+        return 0;
+    }, reinterpret_cast<LPARAM>(&found), 0);
+    ReleaseDC(nullptr, dc);
+    return found;
+}
+
 void MakeFonts() {
     for (HFONT f : {g_uiFont, g_symFont, g_monoFont}) if (f) DeleteObject(f);
     int dpi = int(GetDpiForWindow(g_frame));
     g_uiFont = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    g_symFont = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI Symbol");
+
+    const wchar_t* symFace = L"Segoe UI Symbol";
+    if (FontExists(L"Segoe Fluent Icons")) symFace = L"Segoe Fluent Icons";
+    else if (FontExists(L"Segoe MDL2 Assets")) symFace = L"Segoe MDL2 Assets";
+    g_symFont = CreateFontW(-MulDiv(11, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, symFace);
+
     g_monoFont = CreateFontW(-MulDiv(9, dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Consolas");
-    for (HWND h : {g_addr, g_sec, g_status, g_js}) SendMessageW(h, WM_SETFONT, WPARAM(g_uiFont), TRUE);
-    for (HWND h : {g_back, g_fwd, g_reload, g_home}) SendMessageW(h, WM_SETFONT, WPARAM(g_symFont), TRUE);
+    for (HWND h : {g_addr, g_status}) SendMessageW(h, WM_SETFONT, WPARAM(g_uiFont), TRUE);
+    for (HWND h : {g_back, g_fwd, g_reload, g_home, g_sec, g_js}) SendMessageW(h, WM_SETFONT, WPARAM(g_symFont), TRUE);
     SendMessageW(g_console, WM_SETFONT, WPARAM(g_monoFont), TRUE);
 }
 
@@ -1116,7 +1145,7 @@ void LayoutFrame() {
     int x = pad;
     for (HWND b : {g_back, g_fwd, g_reload, g_home}) { MoveWindow(b, x, pad, bw, bh, TRUE); x += bw + int(2 * s); }
     x += pad;
-    int secW = int(86 * s), jsW = int(44 * s);
+    int secW = int(96 * s), jsW = int(58 * s);
     MoveWindow(g_sec, x, pad + int(6 * s), secW, bh - int(8 * s), TRUE);
     x += secW;
     MoveWindow(g_addr, x, pad + int(2 * s), std::max(50, int(rc.right) - x - pad - jsW - pad), bh - int(4 * s), TRUE);
@@ -1161,11 +1190,11 @@ LRESULT CALLBACK FrameProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         auto btn = [&](const wchar_t* t, int id, DWORD extra = BS_PUSHBUTTON) {
             return CreateWindowExW(0, L"BUTTON", t, WS_CHILD | WS_VISIBLE | extra, 0, 0, 10, 10, h, HMENU(INT_PTR(id)), g_inst, nullptr);
         };
-        g_back = btn(L"←", ID_BACK);
-        g_fwd = btn(L"→", ID_FWD);
-        g_reload = btn(L"↻", ID_RELOAD);
-        g_home = btn(L"⌂", ID_HOME);
-        g_js = btn(L"JS", ID_JS, BS_AUTOCHECKBOX | BS_PUSHLIKE);
+        g_back = btn(L"\uE72B", ID_BACK);
+        g_fwd = btn(L"\uE72A", ID_FWD);
+        g_reload = btn(L"\uE72C", ID_RELOAD);
+        g_home = btn(L"\uE80F", ID_HOME);
+        g_js = btn(L"\uE943 JS", ID_JS, BS_AUTOCHECKBOX | BS_PUSHLIKE);
         SendMessageW(g_js, BM_SETCHECK, g_jsEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
         g_sec = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 10, 10, h, HMENU(INT_PTR(ID_SEC)), g_inst, nullptr);
         g_addr = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, h, HMENU(INT_PTR(ID_ADDR)), g_inst, nullptr);
@@ -1206,7 +1235,7 @@ LRESULT CALLBACK FrameProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (HWND(l) == g_sec) {
             std::wstring t(32, L'\0');
             t.resize(size_t(GetWindowTextW(g_sec, &t[0], 32)));
-            SetTextColor(dc, t.find(L"HTTPS") != std::wstring::npos ? RGB(22, 128, 61) : t.find(L"HTTP") != std::wstring::npos ? RGB(185, 28, 28) : RGB(70, 80, 100));
+            SetTextColor(dc, t.find(L"HTTPS") != std::wstring::npos ? RGB(22, 128, 61) : t.find(L"HTTP") != std::wstring::npos ? RGB(185, 28, 28) : RGB(37, 99, 235));
         } else {
             SetTextColor(dc, RGB(90, 98, 112));
         }

@@ -53,6 +53,15 @@ bool ImageStore::Lookup(const Node* img, float& w, float& h, std::wstring& key) 
     return true;
 }
 
+bool ImageStore::LookupByKey(const std::wstring& key, float& w, float& h) {
+    if (key.empty()) return false;
+    auto it = map.find(key);
+    if (it == map.end() || it->second.state != 1) return false;
+    w = float(it->second.w);
+    h = float(it->second.h);
+    return true;
+}
+
 ID2D1Bitmap* ImageStore::Bitmap(ID2D1RenderTarget* rt, const std::wstring& key) {
     auto it = map.find(key);
     if (it == map.end() || it->second.state != 1) return nullptr;

@@ -2,6 +2,7 @@
 // Blok akisi, satir ici metin (kelime kaydirma, hizalama, taban cizgisi),
 // liste isaretleri ve otomatik genislikli tablolar.
 #include "layout.h"
+#include "url.h"
 #include "util.h"
 #include <algorithm>
 #include <cmath>
@@ -43,11 +44,16 @@ public:
     Layouter(const Document& d, const std::vector<Style>& s, ITextMeasurer& tm, PageLayout& out, IImageProvider* img)
         : doc_(d), S_(s), tm_(tm), out_(out), img_(img), memo_(s.size(), int8_t(-1)) {}
 
+    struct ContainingBlock {
+        float x = 0, y = 0, w = 800, h = 600;
+    };
+
     void Run(float vw) {
         out_.items.clear();
         out_.links.clear();
         out_.width = vw;
-        out_.height = BlockChildren(doc_.root.get(), 0, 0, vw, 0);
+        ContainingBlock cb{0, 0, vw, 600};
+        out_.height = BlockChildren(doc_.root.get(), 0, 0, vw, 0, cb);
         // Sayfa arka plani: html, yoksa body
         uint32_t bg = 0;
         for (auto& k : doc_.root->kids) {
@@ -58,6 +64,9 @@ public:
                     if (b->kind == Node::Elem && b->name == L"body") bg = St(b.get()).bg;
         }
         if (bg >> 24) out_.background = 0xFF000000 | bg;
+        std::stable_sort(out_.items.begin(), out_.items.end(), [](const DisplayItem& a, const DisplayItem& b) {
+            return a.zIndex < b.zIndex;
+        });
     }
 
 private:
@@ -134,6 +143,16 @@ private:
     }
 
     void Borders(const Style& s, float x, float y, float w, float h) {
+        if (s.borderRadius > 0 && s.bw[0] > 0) {
+            DisplayItem d;
+            d.kind = DisplayItem::Stroke;
+            d.x = x + s.bw[0] * 0.5f; d.y = y + s.bw[0] * 0.5f;
+            d.w = std::max(0.f, w - s.bw[0]); d.h = std::max(0.f, h - s.bw[0]);
+            d.color = s.bc[0];
+            d.radius = s.borderRadius;
+            out_.items.push_back(std::move(d));
+            return;
+        }
         if (s.bw[0] > 0) FillRect(x, y, w, s.bw[0], s.bc[0]);
         if (s.bw[2] > 0) FillRect(x, y + h - s.bw[2], w, s.bw[2], s.bc[2]);
         if (s.bw[3] > 0) FillRect(x, y, s.bw[3], h, s.bc[3]);
@@ -142,7 +161,7 @@ private:
 
     // ---------------- Blok akisi ----------------
 
-    float BlockChildren(const Node* n, float x, float y, float w, size_t depth, float gap = 0) {
+    float BlockChildren(const Node* n, float x, float y, float w, size_t depth, const ContainingBlock& cb = ContainingBlock(), float gap = 0) {
         if (depth > kMaxDepth) return 0;
         bool firstBlock = true;
         float cy = y, prevMB = 0;
@@ -153,33 +172,93 @@ private:
             run.clear();
             if (h > 0) { cy += prevMB; prevMB = 0; cy += h; }
         };
+
+        float floatX = x;
+        float floatRowH = 0;
+        bool floatActive = false;
+        auto clearFloats = [&]() {
+            if (floatActive) {
+                cy = std::max(cy, cy + floatRowH);
+                floatX = x;
+                floatRowH = 0;
+                floatActive = false;
+            }
+        };
+
         for (auto& kp : n->kids) {
             const Node* k = kp.get();
             if (k->kind == Node::Text) { run.push_back(k); continue; }
             if (k->kind != Node::Elem) continue;
             const Style& ks = St(k);
             if (ks.display == Style::None) continue;
+
+            if (ks.position >= 2) {
+                float ml = R(ks.m[3], cb.w), mr = R(ks.m[1], cb.w);
+                float mt = R(ks.m[0], cb.w), mb = R(ks.m[2], cb.w);
+                float itemW = (ks.width.u == Len::Px) ? ks.width.v : (ks.width.u == Len::Pct ? R(ks.width, cb.w) : cb.w);
+                float absX = x + ml;
+                if (ks.left.u != Len::Auto) absX = cb.x + R(ks.left, cb.w) + ml;
+                else if (ks.right.u != Len::Auto) absX = cb.x + cb.w - R(ks.right, cb.w) - itemW - mr;
+
+                float absY = cy + mt;
+                if (ks.top.u != Len::Auto) absY = cb.y + R(ks.top, cb.h) + mt;
+                else if (ks.bottom.u != Len::Auto) absY = cb.y + std::max(cb.h, 600.f) - R(ks.bottom, cb.h) - mb;
+
+                Box(k, absX, absY, cb.w, depth + 1, cb);
+                continue;
+            }
+
             if (IsBlockLevel(k, depth)) {
                 flush();
+                if (ks.clear != 0) {
+                    clearFloats();
+                }
                 float mt = R(ks.m[0], w), mb = R(ks.m[2], w);
+
+                if (ks.floatSide == 1) {
+                    float ml = R(ks.m[3], w), mr = R(ks.m[1], w);
+                    float itemW = (ks.width.u == Len::Px) ? ks.width.v : (ks.width.u == Len::Pct ? R(ks.width, w) : 0);
+                    if (itemW <= 0) itemW = ItemMaxContent(k, depth + 1);
+                    float outerW = itemW + ml + mr;
+
+                    if (floatActive && floatX + outerW > x + w + 0.5f) {
+                        cy += floatRowH;
+                        floatX = x;
+                        floatRowH = 0;
+                    }
+                    float h = Box(k, floatX, cy, w, depth + 1, cb);
+                    floatX += outerW;
+                    floatRowH = std::max(floatRowH, h + mt + mb);
+                    floatActive = true;
+                    continue;
+                }
+
+                if (floatActive) {
+                    clearFloats();
+                }
+
                 if (!firstBlock) cy += gap;
                 firstBlock = false;
                 cy += Collapse(prevMB, mt);
                 prevMB = 0;
-                cy += Box(k, x, cy, w, depth + 1);
+                cy += Box(k, x, cy, w, depth + 1, cb);
                 prevMB = mb;
             } else {
                 run.push_back(k);
             }
         }
         flush();
+        if (floatActive) {
+            clearFloats();
+        }
         cy += prevMB;
         return cy - y;
     }
 
     // Eleman kutusunu (y = kenarlik ust kenari) yerlestirir; kenarlik kutusu yuksekligini dondurur.
-    float Box(const Node* n, float x, float y, float availW, size_t depth) {
+    float Box(const Node* n, float x, float y, float availW, size_t depth, const ContainingBlock& cb = ContainingBlock()) {
         const Style& s = St(n);
+        size_t itemStart = out_.items.size();
         float ml = R(s.m[3], availW), mr = R(s.m[1], availW);
         float pl = R(s.p[3], availW), pr = R(s.p[1], availW);
         float pt = R(s.p[0], availW), pb = R(s.p[2], availW);
@@ -192,6 +271,9 @@ private:
         if (!autoW) {
             cw = R(s.width, availW);
             if (s.borderBox) cw -= extra;
+            constrained = true;
+        } else if (s.position >= 2) {
+            cw = std::min(availW - ml - mr - extra, ItemMaxContent(n, depth + 1));
             constrained = true;
         } else if (s.display == Style::Table) {
             std::vector<float> cols;
@@ -207,14 +289,23 @@ private:
         }
         cw = std::max(0.f, cw);
         float outer = cw + extra;
-        if (constrained) {
+        if (constrained && s.position < 2) {
             bool la = s.m[3].u == Len::Auto, ra = s.m[1].u == Len::Auto;
             if (la && ra) ml = std::max(0.f, (availW - outer) / 2);
             else if (la) ml = std::max(0.f, availW - outer - mr);
         }
         float bx = x + ml;
         size_t bgIdx = (s.bg >> 24) ? Reserve() : size_t(-1);
+        size_t bgImgIdx = (!s.bgImage.empty()) ? Reserve() : size_t(-1);
         float cx = bx + bl + pl, cy = y + bt + pt;
+
+        ContainingBlock childCB = cb;
+        if (s.position != 0) {
+            childCB.x = bx;
+            childCB.y = y;
+            childCB.w = outer;
+            childCB.h = (s.height.u == Len::Px) ? s.height.v : 0;
+        }
 
         std::wstring savedMarker;
         if (s.display == Style::ListItem) {
@@ -259,7 +350,7 @@ private:
         } else if (s.display == Style::Table) ch = TableContent(n, cx, cy, cw, depth);
         else if (s.flex == 1) ch = FlexRow(n, cx, cy, cw, depth);
         else if (s.gridCols > 0) ch = Grid(n, cx, cy, cw, depth);
-        else ch = BlockChildren(n, cx, cy, cw, depth, s.flex == 2 ? s.gapRow : 0.f);
+        else ch = BlockChildren(n, cx, cy, cw, depth, childCB, s.flex == 2 ? s.gapRow : 0.f);
         if (s.display == Style::ListItem) marker_ = savedMarker.empty() ? std::wstring() : savedMarker;
         if (s.height.u == Len::Px) ch = std::max(ch, s.height.v - (s.borderBox ? pt + pb + bt + bb : 0));
 
@@ -267,8 +358,55 @@ private:
         if (bgIdx != size_t(-1)) {
             DisplayItem& d = out_.items[bgIdx];
             d.x = bx; d.y = y; d.w = outer; d.h = bh; d.color = s.bg;
+            if (s.borderRadius > 0) d.radius = s.borderRadius;
+        }
+        if (bgImgIdx != size_t(-1)) {
+            DisplayItem& d = out_.items[bgImgIdx];
+            d.kind = DisplayItem::Image;
+            d.isBackground = true;
+            d.x = bx + bl; d.y = y + bt; d.w = std::max(0.f, outer - bl - br); d.h = std::max(0.f, bh - bt - bb);
+            d.text = StartsWith(ToLower(s.bgImage), L"data:") ? s.bgImage : ResolveUrl(doc_.baseHref, s.bgImage);
+            if (s.borderRadius > 0) d.radius = s.borderRadius;
+
+            float nw = 0, nh = 0;
+            bool hasDim = img_ && img_->LookupByKey(d.text, nw, nh);
+            float sx = 0, sy = 0;
+            if (s.bgPosX.u == Len::Px) {
+                if (s.bgPosX.v < 0) sx = -s.bgPosX.v;
+                else { d.x += s.bgPosX.v; d.w = std::max(0.f, d.w - s.bgPosX.v); }
+            } else if (s.bgPosX.u == Len::Pct && hasDim && nw > d.w) {
+                sx = (nw - d.w) * s.bgPosX.v / 100.f;
+            }
+            if (s.bgPosY.u == Len::Px) {
+                if (s.bgPosY.v < 0) sy = -s.bgPosY.v;
+                else { d.y += s.bgPosY.v; d.h = std::max(0.f, d.h - s.bgPosY.v); }
+            } else if (s.bgPosY.u == Len::Pct && hasDim && nh > d.h) {
+                sy = (nh - d.h) * s.bgPosY.v / 100.f;
+            }
+            d.srcX = sx;
+            d.srcY = sy;
+            d.srcW = d.w;
+            d.srcH = d.h;
         }
         Borders(s, bx, y, outer, bh);
+
+        // position: relative offset
+        if (s.position == 1) {
+            float dx = (s.left.u != Len::Auto) ? R(s.left, availW) : ((s.right.u != Len::Auto) ? -R(s.right, availW) : 0);
+            float dy = (s.top.u != Len::Auto) ? R(s.top, availW) : ((s.bottom.u != Len::Auto) ? -R(s.bottom, availW) : 0);
+            if (dx != 0 || dy != 0) {
+                for (size_t idx = itemStart; idx < out_.items.size(); idx++) {
+                    out_.items[idx].x += dx;
+                    out_.items[idx].y += dy;
+                }
+            }
+        }
+        // z-index propagation
+        if (s.hasZIndex) {
+            for (size_t idx = itemStart; idx < out_.items.size(); idx++) {
+                if (out_.items[idx].zIndex == 0) out_.items[idx].zIndex = s.zIndex;
+            }
+        }
         return bh;
     }
 
@@ -311,7 +449,7 @@ private:
     }
 
     void TextPieces(const std::wstring& text, const Style& s, int link, std::vector<Piece>& pc, bool& space, int node) {
-        if (pc.size() > 200000) return;
+        if (s.textIndentOffscreen || pc.size() > 200000) return;
         int f = tm_.Font(s);
         FontMetrics fm = tm_.Metrics(f);
         float lh = LineH(s, fm);

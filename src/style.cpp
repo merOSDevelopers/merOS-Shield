@@ -130,6 +130,44 @@ std::wstring SubstVars(const std::wstring& v, const VarMap* vars, int depth = 0)
     return out;
 }
 
+std::wstring ExtractUrl(const std::wstring& s) {
+    size_t u = s.find(L"url(");
+    if (u == std::wstring::npos) return L"";
+    size_t start = u + 4;
+    while (start < s.size() && (s[start] == L' ' || s[start] == L'\t' || s[start] == L'"' || s[start] == L'\'')) start++;
+    size_t end = s.find(L')', start);
+    if (end == std::wstring::npos) end = s.size();
+    while (end > start && (s[end - 1] == L' ' || s[end - 1] == L'\t' || s[end - 1] == L'"' || s[end - 1] == L'\'')) end--;
+    return s.substr(start, end - start);
+}
+
+void ParseBgPosition(const std::wstring& v, float fs, Len& px, Len& py) {
+    auto t = SplitWS(v);
+    if (t.empty()) return;
+    auto parseOne = [fs](const std::wstring& tok, bool isY) -> Len {
+        if (tok == L"left") return Len{0, Len::Pct};
+        if (tok == L"right") return Len{100, Len::Pct};
+        if (tok == L"top") return Len{0, Len::Pct};
+        if (tok == L"bottom") return Len{100, Len::Pct};
+        if (tok == L"center") return Len{50, Len::Pct};
+        Len l;
+        if (ParseLen(tok, fs, l)) return l;
+        return Len{isY ? 50.f : 0.f, Len::Pct};
+    };
+    if (t.size() == 1) {
+        if (t[0] == L"top" || t[0] == L"bottom") {
+            px = Len{50, Len::Pct};
+            py = parseOne(t[0], true);
+        } else {
+            px = parseOne(t[0], false);
+            py = Len{50, Len::Pct};
+        }
+    } else {
+        px = parseOne(t[0], false);
+        py = parseOne(t[1], true);
+    }
+}
+
 void SetBoxSides(Len* box, const std::wstring& v, float fs) {
     auto t = SplitWS(v);
     Len l[4];
@@ -209,8 +247,40 @@ void ApplyDecl(Style& s, const Style& parent, const std::wstring& prop, const st
         uint32_t c; if (ParseColor(v, c)) s.bg = c;
         else if (inherit) s.bg = parent.bg;
     } else if (prop == L"background") {
-        if (v == L"none" || v == L"transparent") { s.bg = 0; return; }
-        for (auto& tok : SplitWS(v)) { uint32_t c; if (ParseColor(tok, c)) { s.bg = c; break; } }
+        if (v == L"none" || v == L"transparent") { s.bg = 0; s.bgImage.clear(); return; }
+        std::wstring u = ExtractUrl(val);
+        if (!u.empty()) s.bgImage = u;
+        if (v.find(L"no-repeat") != std::wstring::npos) s.bgRepeat = 1;
+        else if (v.find(L"repeat-x") != std::wstring::npos) s.bgRepeat = 2;
+        else if (v.find(L"repeat-y") != std::wstring::npos) s.bgRepeat = 3;
+
+        std::vector<std::wstring> posTokens;
+        for (auto& tok : SplitWS(v)) {
+            if (StartsWith(tok, L"url(") || tok.find(L')') != std::wstring::npos) continue;
+            if (tok == L"no-repeat" || tok == L"repeat" || tok == L"repeat-x" || tok == L"repeat-y") continue;
+            if (tok == L"scroll" || tok == L"fixed" || tok == L"local") continue;
+            uint32_t c;
+            if (ParseColor(tok, c)) { s.bg = c; continue; }
+            posTokens.push_back(tok);
+        }
+        if (!posTokens.empty()) {
+            std::wstring posStr;
+            for (auto& pt : posTokens) { if (!posStr.empty()) posStr += L' '; posStr += pt; }
+            ParseBgPosition(posStr, fs, s.bgPosX, s.bgPosY);
+        }
+    } else if (prop == L"background-image") {
+        if (v == L"none") s.bgImage.clear();
+        else {
+            std::wstring u = ExtractUrl(val);
+            if (!u.empty()) s.bgImage = u;
+        }
+    } else if (prop == L"background-position") {
+        ParseBgPosition(v, fs, s.bgPosX, s.bgPosY);
+    } else if (prop == L"background-repeat") {
+        if (v == L"no-repeat") s.bgRepeat = 1;
+        else if (v == L"repeat-x") s.bgRepeat = 2;
+        else if (v == L"repeat-y") s.bgRepeat = 3;
+        else s.bgRepeat = 0;
     } else if (prop == L"font-size") {
         ApplyFontSize(s, parent, v);
     } else if (prop == L"font-weight") {
@@ -331,9 +401,33 @@ void ApplyDecl(Style& s, const Style& parent, const std::wstring& prop, const st
     } else if (prop == L"clip" || prop == L"clip-path") {
         if (v.find(L"rect(0") != std::wstring::npos || v.find(L"inset(50%") != std::wstring::npos || v.find(L"rect(1px") != std::wstring::npos)
             s.hiddenClip = true;
-    } else if (prop == L"left" || prop == L"top" || prop == L"right" || prop == L"text-indent") {
+    } else if (prop == L"top") {
+        Len l; if (ParseLen(v, fs, l)) s.top = l;
+        if (l.u == Len::Px && l.v <= -999) s.offscreen = true;
+    } else if (prop == L"bottom") {
+        Len l; if (ParseLen(v, fs, l)) s.bottom = l;
+    } else if (prop == L"left") {
+        Len l; if (ParseLen(v, fs, l)) s.left = l;
+        if (l.u == Len::Px && l.v <= -999) s.offscreen = true;
+    } else if (prop == L"right") {
+        Len l; if (ParseLen(v, fs, l)) s.right = l;
+        if (l.u == Len::Px && l.v <= -999) s.offscreen = true;
+    } else if (prop == L"z-index") {
+        if (v == L"auto") { s.hasZIndex = false; s.zIndex = 0; }
+        else {
+            s.zIndex = _wtoi(v.c_str());
+            s.hasZIndex = true;
+        }
+    } else if (prop == L"clear") {
+        if (v == L"left") s.clear = 1;
+        else if (v == L"right") s.clear = 2;
+        else if (v == L"both") s.clear = 3;
+        else s.clear = 0;
+    } else if (prop == L"border-radius") {
+        Len l; if (ParseLen(v, fs, l) && l.u == Len::Px) s.borderRadius = std::max(0.f, l.v);
+    } else if (prop == L"text-indent") {
         Len l;
-        if (ParseLen(v, fs, l) && l.u == Len::Px && l.v <= -999) s.offscreen = true;
+        if (ParseLen(v, fs, l) && l.u == Len::Px && l.v <= -999) s.textIndentOffscreen = true;
     } else if (prop == L"flex-direction") {
         s.flexDirCol = (v == L"column" || v == L"column-reverse");
         if (s.flex) s.flex = s.flexDirCol ? 2 : 1;
@@ -436,11 +530,18 @@ Style Inherit(const Style& p) {
     s.valign = 1;
     s.position = 0;
     s.overflowHidden = s.hiddenClip = s.offscreen = s.invisible = false;
-    s.cellSpacing = p.collapse ? 0 : 2;
+    s.cellSpacing = p.collapse ? 0.f : 2.f;
     s.colspan = 1;
     s.flex = 0; s.flexWrap = false; s.justify = 0; s.alignItems = 0; s.gapRow = s.gapCol = 0;
     s.flexGrow = 0; s.flexBasis = {0, Len::Auto}; s.gridCols = 0; s.floatSide = 0; s.order = 0;
     s.flexDirCol = false; s.gridTemplate = 0;
+    s.clear = 0;
+    s.bgImage.clear();
+    s.bgPosX = {0, Len::Px}; s.bgPosY = {0, Len::Px}; s.bgRepeat = 0;
+    s.top = {0, Len::Auto}; s.right = {0, Len::Auto}; s.bottom = {0, Len::Auto}; s.left = {0, Len::Auto};
+    s.zIndex = 0; s.hasZIndex = false;
+    s.borderRadius = 0;
+    s.textIndentOffscreen = false;
     return s;
 }
 

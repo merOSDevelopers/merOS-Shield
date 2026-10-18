@@ -24,6 +24,7 @@ public:
     std::unordered_map<std::wstring, ImageEntry> map;
 
     bool Lookup(const Node* img, float& w, float& h, std::wstring& key) override;
+    bool LookupByKey(const std::wstring& key, float& w, float& h) override;
     static std::wstring SrcOf(const Node* img); // src / srcset / data-src secimi (ham)
     std::wstring UrlOf(const Node* img) const;  // cozulmus mutlak adres
     ID2D1Bitmap* Bitmap(ID2D1RenderTarget* rt, const std::wstring& key);

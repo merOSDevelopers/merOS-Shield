@@ -60,9 +60,24 @@ struct Style {
     Len flexBasis{0, Len::Auto};
     int gridCols = 0;             // >0 ise grid: sutun sayisi
     uint8_t floatSide = 0;        // 1 sol, 2 sag
+    uint8_t clear = 0;            // 1 sol, 2 sag, 3 her ikisi (both)
     int order = 0;
     bool flexDirCol = false;
     int gridTemplate = 0;
+
+    // Arka plan resmi ve sprite (background-image, position, repeat)
+    std::wstring bgImage;
+    Len bgPosX{0, Len::Px}, bgPosY{0, Len::Px};
+    uint8_t bgRepeat = 0;         // 0: repeat, 1: no-repeat, 2: repeat-x, 3: repeat-y
+
+    // Konumlandirma ve katmanlama (position: absolute/relative, top, left, z-index)
+    Len top{0, Len::Auto}, right{0, Len::Auto}, bottom{0, Len::Auto}, left{0, Len::Auto};
+    int32_t zIndex = 0;
+    bool hasZIndex = false;
+
+    // Modern gorsel ozellikler
+    float borderRadius = 0;       // border-radius (px)
+    bool textIndentOffscreen = false; // text-indent: -9999px kutuyu silmez, metni gizler
 };
 
 // Tum dugumlerin stilini hesaplar (indeks = Node::id). Is parcaciginda calisabilir.

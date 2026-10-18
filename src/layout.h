@@ -34,6 +34,12 @@ struct DisplayItem {
     int link = -1;
     int node = -1;       // ilgili eleman (tiklama hedefi, form alani)
     std::wstring text;   // metin; Image icin resim anahtari (URL)
+
+    // CSS sprite kesme ve konumlandirma
+    float srcX = 0, srcY = 0, srcW = 0, srcH = 0;
+    float radius = 0;    // border-radius
+    int32_t zIndex = 0;  // katmanlama siralamasi
+    bool isBackground = false; // arka plan resmi
 };
 
 // Yuklenmis resimlerin boyutlarini yerlesime bildirir (platformdan bagimsiz).
@@ -42,6 +48,8 @@ public:
     virtual ~IImageProvider() {}
     // img dugumu icin yuklu resim varsa dogal boyutunu ve cizim anahtarini dondurur.
     virtual bool Lookup(const Node* img, float& w, float& h, std::wstring& key) = 0;
+    // URL anahtarina gore boyut dondurur (arka plan resmi ve CSS sprite'lar icin)
+    virtual bool LookupByKey(const std::wstring& key, float& w, float& h) { return false; }
 };
 
 struct PageLayout {
