@@ -1,0 +1,81 @@
+// merOS Shield - merJS : sözdizimi ağacı, sözcük çözümleyici ve ayrıştırıcı
+#pragma once
+#include <memory>
+#include <string>
+#include <vector>
+#include "js.h"
+
+namespace mer {
+namespace js {
+
+enum class K : uint8_t {
+    // Ifadeler
+    Num, Str, Tpl, TaggedTpl, Ident, This, Super, Null, True, False, Regex, Arr, ObjLit, Property,
+    Func, Class, ClassMember, Unary, Update, Bin, Logic, Assign, Cond, Call, New, Member, Index, Seq,
+    Spread, Hole, NewTarget, Await, Yield, ImportCall, ImportMeta,
+    // Kaliplar (destructuring)
+    ObjPat, ArrPat, AssignPat, Rest,
+    // Deyimler
+    VarDecl, Declarator, ExprStmt, Block, If, For, ForIn, ForOf, While, DoWhile, Return, Break,
+    Continue, Throw, Try, Switch, Case, Empty, Labeled, Program, With,
+    // ES Modulleri
+    ImportDecl, ImportSpec, ExportDecl, ExportDefault, ExportAll
+};
+
+// Operatorler (Bin/Logic/Assign/Unary/Update op alani)
+enum Op : uint8_t {
+    O_None, O_Add, O_Sub, O_Mul, O_Div, O_Mod, O_Exp, O_Shl, O_Shr, O_UShr, O_BitAnd, O_BitOr, O_BitXor,
+    O_Eq, O_Ne, O_SEq, O_SNe, O_Lt, O_Gt, O_Le, O_Ge, O_In, O_InstanceOf,
+    O_And, O_Or, O_Nullish,
+    O_Not, O_Neg, O_Pos, O_BitNot, O_TypeOf, O_Void, O_Delete,
+    O_Inc, O_Dec
+};
+
+struct FuncInfo {
+    std::vector<Ast*> params;
+    Ast* body = nullptr;           // Block ya da (exprBody ise) ifade
+    bool arrow = false, exprBody = false, usesArgs = false, isAsync = false, isGen = false;
+    bool simpleParams = true;
+    std::wstring name;
+    std::vector<std::wstring> varNames;   // yukari tasinan var adlari
+    int kind = 0;                  // 0 normal, 1 metot, 2 getter, 3 setter, 4 sinif kurucusu
+};
+
+struct Ast {
+    K k;
+    uint8_t op = 0;
+    bool flag = false;     // Member/Call: optional (?.), Update: prefix, Property: computed, VarDecl: -
+    bool flag2 = false;    // Property: shorthand/method, Block: sozcuksel bildirim icerir, Member: optional zincir koku
+    uint8_t kind = 0;      // VarDecl: 0 var 1 let 2 const; Property: 0 deger 1 get 2 set; ClassMember: 0 metot 1 get 2 set 3 alan
+    bool isStatic = false;
+    int line = 0;
+    double num = 0;
+    Str str;               // ad / dize / regex kaynagi
+    std::wstring str2;     // regex bayraklari / etiket
+    Ast *a = nullptr, *b = nullptr, *c = nullptr, *d = nullptr;
+    std::vector<Ast*> list;
+    std::vector<Str> cooked; // sablon dize parcalari
+    std::vector<Str> raw;
+    FuncInfo* fi = nullptr;
+};
+
+struct Script {
+    std::vector<std::unique_ptr<Ast>> nodes;
+    std::vector<std::unique_ptr<FuncInfo>> funcs;
+    Ast* root = nullptr;
+    std::wstring name;
+    Ast* New(K k, int line) {
+        nodes.emplace_back(new Ast());
+        nodes.back()->k = k;
+        nodes.back()->line = line;
+        return nodes.back().get();
+    }
+};
+
+struct SyntaxErr { std::wstring msg; int line; };
+
+// Kaynagi ayristirir; hata durumunda SyntaxErr firlatir.
+void ParseProgram(const std::wstring& src, Script& out);
+
+} // namespace js
+} // namespace mer
