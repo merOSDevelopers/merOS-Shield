@@ -102,4 +102,54 @@ merJS is a custom AST-walking interpreter equipped with an exact mark-and-sweep 
 - `document` (`querySelector`/`querySelectorAll`, `getElementById`, `createElement`, `write`, `cookie` getter/setter).
 - `Element` (`innerHTML`, `textContent`, `classList`, `style`, `dataset`, `value`, events, `closest`, `matches`, `insertAdjacentHTML`).
 - Event propagation (bubbling, `preventDefault`, `stopPropagation`, inline `onclick`, `addEventListener`).
-- `location`, `history.pushState`, in-memory `localStorage`/`sessionStorage
+- `location`, `history.pushState`, in-memory `localStorage`/`sessionStorage`, `URL`, `URLSearchParams`, `matchMedia`, `IntersectionObserver`.
+- Dynamic `<script>` loading with automated dependency chaining.
+
+---
+
+## Video & Media Subsystem
+
+merOS Shield includes a built-in media pipeline integrating **Windows Media Foundation (WMF)**:
+- Hardware and software decoding for video codecs (H.264, VP9, MP4).
+- Decompression into 32-bit BGRA video frames.
+- Seamless bridge with MSE (`SourceBuffer.prototype.appendBuffer`) for chunk-based streaming platforms (e.g. YouTube DASH).
+- Real-time video surface rendering via Direct2D hardware bitmaps.
+
+---
+
+## Internationalization & Localization (i18n)
+
+merOS Shield features a bilingual localization system:
+- **Default Language:** **English (`en-US`)** across all UI elements, status notifications, network headers, and DOM environments.
+- **Supported Languages:** English (`en-US`) and Turkish (`tr-TR`).
+- **HTTP Network Layer:** Automatically sends `Accept-Language: en-US,en;q=0.9,tr-TR;q=0.8,tr;q=0.7`.
+- **DOM Navigator:** Configured with `navigator.language = 'en-US'` and `navigator.languages = ['en-US', 'en', 'tr-TR', 'tr']`.
+- **One-Click Language Toggle:** Switch languages on the fly directly from the New Tab page (`about:home`) via `about:lang?tr` and `about:lang?en`.
+
+---
+
+## Security & Privacy Architecture
+
+- **Strict HTTPS-Only:** Mandatory TLS 1.2 and TLS 1.3 via Windows SChannel. Invalid, self-signed, or expired certificates are never bypassed. Insecure HTTP→HTTPS upgrades occur automatically; plaintext HTTP requires explicit user consent.
+- **Built-in Ad & Tracker Blocker:** Subresource requests to known advertising and telemetry domains are intercepted and dropped before network dispatch.
+- **Privacy First:** No third-party cookies; zero disk persistence for cookies (session-only, wiped on exit). No HTTP `Referer` headers emitted; `Sec-GPC: 1` and `DNT: 1` sent by default.
+- **Hardened JavaScript Sandbox:** Per-task execution step limits (prevents infinite loop freezing), recursion depth limits, C++ stack guard limits, and strict heap allocations. Popups and intrusive dialogs are blocked.
+- **Anti-Phishing Defenses:** Deceptive credential tricks (`user@bank.com@evil.site`) are blocked; internationalized domain names (IDN) with lookalike characters are displayed in safe punycode.
+- **Engine Safety Limits:** Maximum 250,000 DOM nodes, depth capped at 400, 24 MB document size limit, 6 MB script cap, and downsampling for oversized images.
+- **OS-Level Process Mitigation:** Control Flow Guard (CFG), Intel CET Shadow Stack, High-Entropy ASLR, DEP, strict handle checks, mandatory System32 DLL signature enforcement, and custom font exploit mitigations.
+
+---
+
+## Roadmap
+
+1. [x] Network APIs (`fetch`, `XMLHttpRequest`, `Headers`)
+2. [x] Typed Arrays (`Uint8Array`, `ArrayBuffer`, `DataView`)
+3. [x] Text encoding (`TextEncoder`, `TextDecoder`)
+4. [x] ECMAScript Modules (`<script type="module">`, `import`/`export`)
+5. [x] Media Source Extensions (MSE) & Video Codec Engine (Windows Media Foundation)
+6. [x] Internationalization API (`Intl` / ECMA-402)
+7. [x] English default language support & i18n subsystem
+8. [ ] Tabbed browsing interface
+9. [ ] In-page search (Ctrl + F), text selection, and clipboard copy
+10. [ ] Additional CSS styling: `position: fixed`, `border-radius`, background gradients
+11. [ ] Multi-process architecture: Sandboxed renderers running with restricted AppContainer tokens
