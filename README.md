@@ -1,2 +1,1 @@
-# merOS-Shield
-My personal, zero-dependency browser engine project in Pre-Alpha stage, built with C++ and VS2019. Focused on privacy and simple architecture.
+[README.md](https://github.com/user-attachments/files/33627165/README.md)
