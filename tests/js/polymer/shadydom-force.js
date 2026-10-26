@@ -1,0 +1,1 @@
+window.ShadyDOM = {force: true};

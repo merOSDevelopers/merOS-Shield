@@ -1,0 +1,12 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Donan sayfa</title></head>
+<body style="font-family:Arial;margin:30px">
+<h1>Donan sayfa testi</h1>
+<p id=s>Basliyor...</p>
+<p><a href="cizim_kalitesi.html">Baska sayfa (betiksiz gezinme testi)</a></p>
+<script>
+setTimeout(function () {
+  document.getElementById('s').textContent = 'Sonsuz dongu basladi';
+  var x = 0;
+  while (true) { x += Math.sqrt(Math.random() * 7); if (x > 1e12) x = 0; }
+}, 800);
+</script></body></html>

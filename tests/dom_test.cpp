@@ -1,4 +1,5 @@
 // merJS + DOM entegrasyon testleri (platformdan bagimsiz)
+#include <atomic>
 #include <cstdio>
 #include "../src/css.h"
 #include "../src/dom.h"
@@ -12,6 +13,10 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <unordered_map>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+#include <functional>
 
 using namespace mer;
 
@@ -33,10 +38,23 @@ struct TestHost : js::Host {
         (void)w; (void)h;
         videoFrames[key] = bgra;
     }
+    // Oynatici is parcacigindan gelen kareler
+    std::mutex frameMu;
+    std::unordered_map<std::wstring, int> frameCount;
+    std::unordered_map<std::wstring, std::pair<int, int>> frameSize;
+    std::function<void(int, int, std::shared_ptr<std::vector<uint8_t>>)> VideoSink(const Node* n) override {
+        std::wstring key = VideoKey(n);
+        return [this, key](int w, int h, std::shared_ptr<std::vector<uint8_t>>) {
+            std::lock_guard<std::mutex> g(frameMu);
+            frameCount[key]++;
+            frameSize[key] = {w, h};
+        };
+    }
+    int Frames(const std::wstring& key) { std::lock_guard<std::mutex> g(frameMu); return frameCount[key]; }
 };
 
 static int fails = 0;
-#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); fails++; } } while (0)
+#define CHECK(c) do { if (!(c)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); std::fflush(stdout); fails++; } } while (0)
 
 
 struct Page {
@@ -51,6 +69,14 @@ struct Page {
         std::wstring out;
         rt.EvalForTest(code, out);
         return out;
+    }
+    // Zamanlayicilari ve medya olaylarini gercek zamanla calistir
+    void Pump(int ms) {
+        double end = rt.Now() + ms;
+        while (rt.Now() < end) {
+            rt.RunDueTimers(rt.Now());
+            Sleep(10);
+        }
     }
 };
 
@@ -333,9 +359,9 @@ int main() {
         // HTMLMediaElement / Video / Audio / YouTube Embed testleri
         p.Run(L"var vid = document.createElement('video');");
         CHECK(p.Run(L"vid.canPlayType('video/mp4; codecs=\"avc1.42E01E\"')") == L"probably");
-        CHECK(p.Run(L"vid.canPlayType('video/webm')") == L"probably");
-        CHECK(p.Run(L"vid.canPlayType('audio/mpeg')") == L"probably");
-        CHECK(p.Run(L"vid.canPlayType('audio/wav')") == L"maybe");
+        CHECK(p.Run(L"vid.canPlayType('video/webm')") == L"");          // yalnizca MP4 (H.264/AAC) cozulebiliyor
+        CHECK(p.Run(L"vid.canPlayType('audio/mpeg')") == L"");
+        CHECK(p.Run(L"vid.canPlayType('video/mp4')") == L"maybe");
         CHECK(p.Run(L"vid.canPlayType('invalid/type')") == L"");
         CHECK(p.Run(L"vid.paused") == L"true");
 
@@ -351,9 +377,9 @@ int main() {
         CHECK(p.Run(L"vid.currentTime") == L"15.5");
         CHECK(p.Run(L"vid.volume") == L"0.5");
         CHECK(p.Run(L"vid.muted") == L"true");
-        CHECK(p.Run(L"vid.readyState") == L"4");
-        CHECK(p.Run(L"vid.videoWidth") == L"640");
-        CHECK(p.Run(L"vid.videoHeight") == L"360");
+        CHECK(p.Run(L"vid.readyState") == L"0");      // kaynak yok: HAVE_NOTHING
+        CHECK(p.Run(L"vid.videoWidth") == L"0");
+        CHECK(p.Run(L"vid.videoHeight") == L"0");
         CHECK(p.Run(L"HTMLVideoElement.HAVE_ENOUGH_DATA") == L"4");
         CHECK(p.Run(L"HTMLMediaElement.NETWORK_IDLE") == L"1");
 
@@ -361,7 +387,7 @@ int main() {
         p.Run(L"var aud = new Audio('sarki.mp3');");
         CHECK(p.Run(L"aud.tagName") == L"AUDIO");
         CHECK(p.Run(L"aud.src.indexOf('sarki.mp3') !== -1") == L"true");
-        CHECK(p.Run(L"aud.canPlayType('audio/mp3')") == L"probably");
+        CHECK(p.Run(L"aud.canPlayType('audio/mp4; codecs=\"mp4a.40.2\"')") == L"probably");
 
         // MediaSource
         CHECK(p.Run(L"typeof MediaSource !== 'undefined'") == L"true");
@@ -401,13 +427,14 @@ int main() {
         CHECK(p.Run(L"isNaN(ms.duration)") == L"true");
         CHECK(p.Run(L"ms.sourceBuffers.length") == L"0");
         CHECK(p.Run(L"MediaSource.isTypeSupported('video/mp4; codecs=\"avc1.4d401f\"')") == L"true");
-        CHECK(p.Run(L"MediaSource.isTypeSupported('audio/webm')") == L"true");
+        CHECK(p.Run(L"MediaSource.isTypeSupported('audio/webm')") == L"false");
         CHECK(p.Run(L"MediaSource.isTypeSupported('video/unsupported')") == L"false");
 
         // 4. Baglama: video.src = URL.createObjectURL(ms) -> sourceopen tetiklenmeli
         p.Run(L"var msUrl = URL.createObjectURL(ms); var sourceOpenFired = false;");
         p.Run(L"ms.addEventListener('sourceopen', function() { sourceOpenFired = true; });");
         p.Run(L"var testVid = document.createElement('video'); testVid.src = msUrl;");
+        p.Pump(50);
         CHECK(p.Run(L"sourceOpenFired") == L"true");
         CHECK(p.Run(L"ms.readyState") == L"open");
 
@@ -425,19 +452,20 @@ int main() {
         // Simule YouTube DASH chunk (Uint8Array)
         p.Run(L"var chunk = new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70]);");
         p.Run(L"sb.appendBuffer(chunk);");
+        CHECK(p.Run(L"sb.updating") == L"true");      // olaylar gorev olarak gelir
+        p.Pump(50);
         CHECK(p.Run(L"updateStartFired") == L"true");
         CHECK(p.Run(L"updateFired") == L"true");
         CHECK(p.Run(L"updateEndFired") == L"true");
         CHECK(p.Run(L"sb.updating") == L"false");
-        CHECK(p.Run(L"sb.buffered.length") == L"1");
-        CHECK(p.Run(L"sb.buffered.end(0)") == L"5");
-        CHECK(p.Run(L"ms.duration") == L"5");
-        CHECK(p.Run(L"testVid.readyState") == L"4"); // HAVE_ENOUGH_DATA
+        CHECK(p.Run(L"sb.buffered.length") == L"0");  // yarim ftyp kutusu: henuz ornek yok
+        CHECK(p.Run(L"testVid.readyState") == L"0");
 
         // 6. endOfStream
         p.Run(L"var sourceEndedFired = false; ms.onsourceended = function() { sourceEndedFired = true; };");
         p.Run(L"ms.endOfStream();");
         CHECK(p.Run(L"ms.readyState") == L"ended");
+        p.Pump(30);
         CHECK(p.Run(L"sourceEndedFired") == L"true");
 
         // 7. removeSourceBuffer
@@ -524,26 +552,46 @@ int main() {
         // Arka plan koyu gri kontrolü
         CHECK(preview.bgra[0] == 18 && preview.bgra[1] == 18 && preview.bgra[2] == 18);
 
-        // 3. Video element kontrol ve durum API'leri
-        Page p(L"<body><video id='vid' width='640' height='360' src='https://video.com/test.mp4'></video></body>");
-
-        p.Run(L"var v = document.getElementById('vid');");
-        CHECK(p.Run(L"v.paused") == L"true");
-        CHECK(p.Run(L"v.videoWidth") == L"640");
-        CHECK(p.Run(L"v.videoHeight") == L"360");
-
-        p.Run(L"v.currentTime = 12.5;");
-        CHECK(p.Run(L"v.currentTime") == L"12.5");
-
-        p.Run(L"v.play();");
-        CHECK(p.Run(L"v.paused") == L"false");
-        CHECK(p.host.videoFrames.count(L"https://video.com/test.mp4") > 0);
-
-        p.Run(L"v.pause();");
-        CHECK(p.Run(L"v.paused") == L"true");
-
-        p.Run(L"v.src = 'https://video.com/dynamically_set.mp4';");
-        CHECK(p.host.videoFrames.count(L"https://video.com/dynamically_set.mp4") > 0);
+        // 3. Gercek oynatma: ilerlemeli MP4 (H.264 + AAC), Blob URL uzerinden
+        std::vector<uint8_t> clip;
+        for (const char* path : {"tests/js/media/small.mp4", "../tests/js/media/small.mp4", "../src/merOSShield/tests/js/media/small.mp4", "/home/claude/src/merOSShield/tests/js/media/small.mp4"}) {
+            std::ifstream f(path, std::ios::binary);
+            if (f) { clip.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); break; }
+        }
+        if (clip.empty()) {
+            std::printf("UYARI: tests/js/media/small.mp4 bulunamadi, video oynatma testi atlandi\n");
+        } else {
+            Page p(L"<body><video id='vid' width='320' height='180'></video></body>");
+            p.rt.DefineData(p.rt.global, L"clipBytes", js::Value::O(p.rt.NewArrayBufferFrom(clip.data(), clip.size())));
+            p.Run(L"var v = document.getElementById('vid'); var evs = [];"
+                  L"['loadedmetadata','canplay','playing','seeked','ended'].forEach(function(t){ v.addEventListener(t, function(){ evs.push(t); }); });");
+            CHECK(p.Run(L"v.paused") == L"true");
+            p.Run(L"v.muted = true; v.src = URL.createObjectURL(new Blob([clipBytes], {type: 'video/mp4'})); v.play();");
+            CHECK(p.Run(L"v.paused") == L"false");
+            p.Pump(800); for (int w = 0; w < 20 && p.Run(L"v.currentTime > 0.3") != L"true"; w++) p.Pump(100);
+            CHECK(p.Run(L"evs.slice(0,3).join(',')") == L"loadedmetadata,canplay,playing");
+            CHECK(p.Run(L"v.videoWidth + 'x' + v.videoHeight") == L"160x90");
+            CHECK(p.Run(L"v.currentTime > 0.3") == L"true");
+            CHECK(p.Run(L"Math.abs(v.duration - 2.04) < 0.06") == L"true");
+            Node* vn = p.doc->root.get();
+            Node* found = nullptr;
+            std::vector<Node*> st{vn};
+            while (!st.empty() && !found) { Node* n = st.back(); st.pop_back(); if (n->name == L"video") found = n; for (auto& k : n->kids) st.push_back(k.get()); }
+            CHECK(found && p.host.Frames(VideoKey(found)) > 5);
+            p.Run(L"v.pause(); v.currentTime = 1.5;");
+            p.Pump(300);
+            CHECK(p.Run(L"evs.indexOf('seeked') >= 0") == L"true");
+            CHECK(p.Run(L"Math.abs(v.currentTime - 1.5) < 0.05") == L"true");
+            p.Run(L"v.play();");
+            // kalan ~0.54 sn; soguk baslangicta kod cozucu yeniden acilisi gecikebilir: 3 sn'ye kadar bekle
+            for (int w = 0; w < 30 && p.Run(L"v.ended") != L"true"; w++) p.Pump(100);
+            CHECK(p.Run(L"v.ended") == L"true");
+            CHECK(p.Run(L"evs[evs.length-1]") == L"ended");
+            // Response.body akisi (Streams)
+            p.Run(L"var sz = 0; fetch(URL.createObjectURL(new Blob([clipBytes]))).then(function(r){ return r.body.getReader().read(); }).then(function(x){ sz = x.value.length; });");
+            p.Pump(30);
+            CHECK(p.Run(L"sz") == std::to_wstring(clip.size()));
+        }
 
         VideoDecoder::Shutdown();
     }
@@ -644,11 +692,267 @@ int main() {
         i18n::SetCurrentLanguage(i18n::Language::English);
         CHECK(std::wstring(i18n::GetLanguageCode()) == L"en-US");
         CHECK(NetErrorText(ERROR_WINHTTP_CANNOT_CONNECT) == L"Could not connect to the server.");
+        // merJS: ES2023 Array non-mutating methods
         {
-            Page pEn(L"<body></body>");
-            CHECK(pEn.Run(L"navigator.language") == L"en-US");
+            Page p(L"<body></body>");
+            CHECK(p.Run(L"let a = [3, 1, 2]; let r = a.toReversed(); a.join(',') + '|' + r.join(',')") == L"3,1,2|2,1,3");
+            CHECK(p.Run(L"let a = [3, 1, 2]; let s = a.toSorted(); a.join(',') + '|' + s.join(',')") == L"3,1,2|1,2,3");
+            CHECK(p.Run(L"let a = [1, 2, 3, 4]; let sp = a.toSpliced(1, 2, 99); a.join(',') + '|' + sp.join(',')") == L"1,2,3,4|1,99,4");
+            CHECK(p.Run(L"let a = [10, 20, 30]; let w = a.with(1, 99); a.join(',') + '|' + w.join(',')") == L"10,20,30|10,99,30");
+        }
+
+        // merJS: structuredClone
+        {
+            Page p(L"<body></body>");
+            CHECK(p.Run(L"let o = { a: 1, b: [2, 3], c: { d: 'test' } }; let cl = structuredClone(o); cl.b.push(4); cl.c.d = 'mod'; o.b.length + '|' + o.c.d + '|' + cl.b.length + '|' + cl.c.d") == L"2|test|3|mod");
+        }
+
+        // merJS: Promise.withResolvers
+        {
+            Page p(L"<body></body>");
+            p.Run(L"var { promise, resolve, reject } = Promise.withResolvers(); var res = 0; promise.then(function(v) { res = v; }); resolve(42);");
+            CHECK(p.Run(L"res") == L"42");
+        }
+
+        // DOM: Element.hasAttributes
+        {
+            Page p(L"<body><div></div></body>");
+            CHECK(p.Run(L"let el = document.createElement('div'); let h1 = el.hasAttributes(); el.setAttribute('id', 'x'); let h2 = el.hasAttributes(); h1 + '|' + h2") == L"false|true");
+        }
+
+        // Web APIs: window.crypto (randomUUID & getRandomValues)
+        {
+            Page p(L"<body></body>");
+            CHECK(p.Run(L"let u = crypto.randomUUID(); u.length === 36 && u[14] === '4'") == L"true");
+            CHECK(p.Run(L"let arr = new Uint8Array(8); crypto.getRandomValues(arr); arr.length === 8") == L"true");
+        }
+
+        // Web APIs: navigator.clipboard (writeText & readText)
+        {
+            Page p(L"<body></body>");
+            p.Run(L"var ok = false; navigator.clipboard.writeText('mer-shield-test'); navigator.clipboard.readText().then(function(t) { ok = (t === 'mer-shield-test'); });");
+            CHECK(p.Run(L"ok") == L"true");
+        }
+
+        // DOM: DocumentFragment insertion unpacking
+        {
+            Page p(L"<body><div id=p></div></body>");
+            CHECK(p.Run(L"let d = document.getElementById('p'); let frag = document.createDocumentFragment(); let c1 = document.createElement('span'); let c2 = document.createElement('b'); frag.appendChild(c1); frag.appendChild(c2); d.appendChild(frag); d.children.length + '|' + frag.childNodes.length") == L"2|0");
+        }
+
+        // merJS: gercek async/await (zamanlayici bekleyen await, sira, DOM ile)
+        {
+            Page p(L"<body><ul id=liste></ul></body>");
+            p.Run(L"var sira = []; var bitti = '';"
+                  L"const uyu = (ms, v) => new Promise(r => setTimeout(() => r(v), ms));"
+                  L"async function yukle() {"
+                  L"  sira.push('bas');"
+                  L"  for (const ad of ['a', 'b', 'c']) {"
+                  L"    const li = document.createElement('li'); li.textContent = await uyu(5, ad);"
+                  L"    document.getElementById('liste').appendChild(li);"
+                  L"  }"
+                  L"  try { await Promise.reject(new Error('ag hatasi')); } catch (e) { sira.push(e.message); }"
+                  L"  return document.querySelectorAll('#liste li').length;"
+                  L"}"
+                  L"yukle().then(n => { bitti = 'n=' + n; }); sira.push('senkron');");
+            CHECK(p.Run(L"sira.join(',') + '|' + bitti") == L"bas,senkron|");
+            for (int i = 0; i < 50 && p.rt.NextTimerDue() >= 0; i++) p.rt.RunDueTimers(p.rt.NextTimerDue());
+            CHECK(p.Run(L"sira.join(',') + '|' + bitti") == L"bas,senkron,ag hatasi|n=3");
+            CHECK(p.Run(L"document.getElementById('liste').textContent") == L"abc");
+        }
+
+        // Custom Elements: yukseltme, yasam dongusu geri cagirmalari, siralama
+        {
+            Page p(L"<body><x-sayac id=s1 deger=3></x-sayac><div id=kap></div></body>");
+            p.Run(L"var log = [];"
+                  L"class XSayac extends HTMLElement {"
+                  L"  static get observedAttributes() { return ['deger']; }"
+                  L"  constructor() { super(); this.tik = 0; log.push('ctor'); }"
+                  L"  connectedCallback() { log.push('bagli:' + this.id); }"
+                  L"  disconnectedCallback() { log.push('ayrildi:' + this.id); }"
+                  L"  attributeChangedCallback(n, o, v) { log.push('attr:' + n + ':' + o + '>' + v); }"
+                  L"  artir() { return ++this.tik; }"
+                  L"}"
+                  L"log.push('once');"
+                  L"customElements.define('x-sayac', XSayac);"
+                  L"log.push('sonra');");
+            CHECK(p.Run(L"log.join(',')") == L"once,ctor,attr:deger:null>3,bagli:s1,sonra");
+            CHECK(p.Run(L"var s = document.getElementById('s1'); (s instanceof XSayac) + ':' + (s instanceof HTMLElement) + ':' + s.artir() + s.artir()") == L"true:true:12");
+            p.Run(L"log = []; s.setAttribute('deger', '9'); s.setAttribute('baska', '1'); s.removeAttribute('deger');");
+            CHECK(p.Run(L"log.join(',')") == L"attr:deger:3>9,attr:deger:9>null");
+            p.Run(L"log = []; var y = document.createElement('x-sayac'); y.id = 'y'; log.push('olustu:' + (y instanceof XSayac));"
+                  L"document.getElementById('kap').appendChild(y); y.remove();");
+            CHECK(p.Run(L"log.join(',')") == L"ctor,olustu:true,bagli:y,ayrildi:y");
+            p.Run(L"log = []; document.getElementById('kap').innerHTML = '<x-sayac id=z deger=1></x-sayac>';");
+            CHECK(p.Run(L"log.join(',')") == L"ctor,attr:deger:null>1,bagli:z");
+            p.Run(L"log = []; var d = new XSayac(); log.push(d.tagName);");
+            CHECK(p.Run(L"log.join(',')") == L"ctor,X-SAYAC");
+            CHECK(p.Run(L"customElements.get('x-sayac') === XSayac") == L"true");
+            CHECK(p.Run(L"customElements.getName(XSayac)") == L"x-sayac");
+            CHECK(p.Run(L"var hata = ''; try { customElements.define('x-sayac', class extends HTMLElement {}); } catch (e) { hata = e.message; } hata.indexOf('already') >= 0") == L"true");
+            CHECK(p.Run(L"var h2 = ''; try { customElements.define('gecersiz', class extends HTMLElement {}); } catch (e) { h2 = e.name; } h2") == L"SyntaxError");
+            CHECK(p.Run(L"var h3 = ''; try { new HTMLElement(); } catch (e) { h3 = e.name; } h3") == L"TypeError");
+            // whenDefined, sonradan tanimlama
+            p.Run(L"var wd = ''; customElements.whenDefined('x-gec').then(c => { wd = c.name; }); document.body.appendChild(document.createElement('x-gec'));");
+            CHECK(p.Run(L"wd") == L"");
+            p.Run(L"class XGec extends HTMLElement { connectedCallback() { this.textContent = 'hazir'; } } customElements.define('x-gec', XGec);");
+            CHECK(p.Run(L"wd + ':' + document.querySelector('x-gec').textContent") == L"XGec:hazir");
+        }
+
+        // Shadow DOM: attachShadow, kapsam, slotlar, olaylar
+        {
+            Page p(L"<body><kart-ogesi id=k><span slot=baslik>Merhaba</span><p>Govde</p></kart-ogesi></body>");
+            p.Run(L"class Kart extends HTMLElement {"
+                  L"  constructor() { super(); const r = this.attachShadow({mode: 'open'});"
+                  L"    r.innerHTML = '<style>:host{display:block}</style><h2><slot name=baslik>Varsayilan</slot></h2><div id=ic><slot></slot></div><button id=b>Tikla</button>'; }"
+                  L"}"
+                  L"customElements.define('kart-ogesi', Kart);"
+                  L"var k = document.getElementById('k'); var r = k.shadowRoot;");
+            CHECK(p.Run(L"r.nodeType + ':' + r.mode + ':' + (r.host === k) + ':' + (r instanceof ShadowRoot)") == L"11:open:true:true");
+            CHECK(p.Run(L"(document.querySelector('#ic') === null) + ':' + (r.querySelector('#ic') !== null) + ':' + (r.getElementById('b').textContent)") == L"true:true:Tikla");
+            CHECK(p.Run(L"r.getElementById('ic').getRootNode() === r") == L"true");
+            CHECK(p.Run(L"r.getElementById('ic').getRootNode({composed: true}) === document") == L"true");
+            CHECK(p.Run(L"r.getElementById('ic').isConnected + ':' + k.contains(r.getElementById('ic'))") == L"true:false");
+            CHECK(p.Run(L"var sl = r.querySelector('slot[name=baslik]'); sl.assignedNodes().length + ':' + sl.assignedElements()[0].textContent") == L"1:Merhaba");
+            CHECK(p.Run(L"var ds = r.querySelector('#ic slot'); ds.assignedElements().map(e => e.tagName).join()") == L"P");
+            CHECK(p.Run(L"(k.querySelector('p').assignedSlot === ds) + ':' + k.querySelector('span').slot") == L"true:baslik");
+            // Olaylar: shadow icinden tiklama host'a hedeflenir; composed:false olay disari cikmaz
+            p.Run(L"var ev = []; k.addEventListener('click', e => { const cp = e.composedPath(); ev.push('host:' + e.target.id + ':' + (cp[1] === r) + (cp[2] === k) + (cp[cp.length - 1] === window)); });"
+                  L"r.getElementById('b').addEventListener('click', e => ev.push('ic:' + e.target.id));"
+                  L"document.body.addEventListener('ozel', e => ev.push('disari'));"
+                  L"r.getElementById('b').dispatchEvent(new CustomEvent('ozel', {bubbles: true}));"
+                  L"r.getElementById('b').dispatchEvent(new CustomEvent('ozel', {bubbles: true, composed: true}));");
+            Node* btn = nullptr;
+            {
+                std::vector<Node*> st{p.doc->root.get()};
+                while (!st.empty()) { Node* n = st.back(); st.pop_back(); if (n->idAttr == L"b") btn = n; for (auto& c : n->kids) st.push_back(c.get()); if (n->shadow) st.push_back(n->shadow.get()); }
+            }
+            CHECK(btn != nullptr);
+            if (btn) p.rt.DispatchClick(btn);
+            CHECK(p.Run(L"ev.join(',')") == L"disari,ic:b,host:k:truetruetrue");
+            // kapali shadow root
+            CHECK(p.Run(L"var c = document.createElement('div'); var cr = c.attachShadow({mode:'closed'}); (c.shadowRoot === null) + ':' + cr.mode") == L"true:closed");
+            CHECK(p.Run(L"var e2 = ''; try { k.attachShadow({mode:'open'}); } catch (e) { e2 = 'NotSupported'; } e2") == L"NotSupported");
+            // template.content + cloneNode
+            p.Run(L"var t = document.createElement('template'); t.innerHTML = '<b>sablon</b><i>2</i>';"
+                  L"var h = document.createElement('div'); h.attachShadow({mode:'open'}).appendChild(t.content.cloneNode(true)); document.body.appendChild(h);");
+            CHECK(p.Run(L"h.shadowRoot.childNodes.length + ':' + h.shadowRoot.querySelector('b').textContent + ':' + t.content.childNodes.length") == L"2:sablon:2");
+            // slotchange
+            p.Run(L"var scn = 0; ds.addEventListener('slotchange', () => scn++); var yeni = document.createElement('em'); k.appendChild(yeni); k.appendChild(document.createElement('em'));");
+            CHECK(p.Run(L"scn") == L"1");
+        }
+
+        // Bildirimsel shadow DOM (ayristirici) + Lit benzeri bilesen
+        {
+            Page p(L"<body><x-dek><template shadowrootmode=open><p id=dp>dekl</p><slot></slot></template><b>L</b></x-dek></body>");
+            CHECK(p.Run(L"document.querySelector('x-dek').shadowRoot.getElementById('dp').textContent") == L"dekl");
+            CHECK(p.Run(L"document.querySelectorAll('template').length") == L"0");
+            p.Run(L"class LitBenzeri extends HTMLElement {"
+                  L"  static properties = { ad: {} };"
+                  L"  #ic = 0;"
+                  L"  constructor() { super(); this.ad = 'dunya'; this.renderRoot = this.attachShadow({mode: 'open'}); }"
+                  L"  connectedCallback() { this.guncelle(); }"
+                  L"  async guncelle() { await null; this.#ic++; this.renderRoot.innerHTML = `<style>p{margin:0}</style><p>Merhaba ${this.ad} #${this.#ic}</p>`; }"
+                  L"}"
+                  L"customElements.define('lit-benzeri', LitBenzeri);"
+                  L"document.body.insertAdjacentHTML('beforeend', '<lit-benzeri></lit-benzeri>');");
+            CHECK(p.Run(L"document.querySelector('lit-benzeri').shadowRoot.querySelector('p').textContent") == L"Merhaba dunya #1");
+        }
+
+        // MutationObserver + ek DOM API'leri
+        {
+            Page p(L"<body><div id=m><span>a</span></div></body>");
+            p.Run(L"var kayit = []; var mo = new MutationObserver((rs, o) => { for (const r of rs) kayit.push(r.type + ':' + (r.attributeName || '') + ':' + r.addedNodes.length + r.removedNodes.length + ':' + (r.oldValue === null ? '-' : r.oldValue)); });"
+                  L"var m = document.getElementById('m'); mo.observe(m, {childList: true, attributes: true, attributeOldValue: true, subtree: true, characterData: true, characterDataOldValue: true});"
+                  L"m.setAttribute('x', '1'); m.setAttribute('x', '2'); m.appendChild(document.createElement('b')); m.firstChild.remove(); m.firstChild.textContent = 'q';"
+                  L"var t = document.createTextNode('eski'); m.appendChild(t); t.data = 'yeni'; kayit.push('senkron:' + kayit.length);");
+            CHECK(p.Run(L"kayit.join(',')") == L"senkron:0,attributes:x:00:-,attributes:x:00:1,childList::10:-,childList::01:-,childList::10:-,childList::10:-,characterData::00:eski");
+            p.Run(L"kayit = []; mo.disconnect(); m.setAttribute('y', '1');");
+            CHECK(p.Run(L"kayit.length") == L"0");
+            p.Run(L"var mo2 = new MutationObserver(() => {}); mo2.observe(m, {attributeFilter: ['z']}); m.setAttribute('y', '2'); m.setAttribute('z', '3'); var trs = mo2.takeRecords().map(r => r.attributeName).join();");
+            CHECK(p.Run(L"trs") == L"z");
+            // Polymer'in mikro gorev zamanlayicisi: metin dugumu + characterData
+            p.Run(L"var tik = 0; var tn = document.createTextNode(''); new MutationObserver(() => tik++).observe(tn, {characterData: true}); tn.textContent = 1; tn.textContent = 2;");
+            CHECK(p.Run(L"tik") == L"1");
+            CHECK(p.Run(L"var a = document.createElement('i'), b = document.createElement('u'); m.append(a, b); a.compareDocumentPosition(b) + ':' + b.compareDocumentPosition(a) + ':' + m.compareDocumentPosition(a) + ':' + a.compareDocumentPosition(m)") == L"4:2:20:10");
+            CHECK(p.Run(L"var x = document.createTextNode('merhaba'); m.appendChild(x); var y = x.splitText(3); x.data + '|' + y.data + '|' + (x.nextSibling === y)") == L"mer|haba|true");
+            CHECK(p.Run(L"m.normalize(); m.lastChild.data") == L"merhaba");
+            CHECK(p.Run(L"document.createRange().createContextualFragment('<p>1</p><p>2</p>').childNodes.length") == L"2");
+            CHECK(p.Run(L"var c = document.createElement('canvas').getContext('2d'); c.fillStyle = 'rgb(10, 20, 30)'; c.fillRect(0,0,1,1); Array.from(c.getImageData(0,0,1,1).data).join()") == L"10,20,30,255");
+            CHECK(p.Run(L"(window instanceof Window) + ':' + typeof Comment + ':' + (document.createComment('z').nodeType) + ':' + CSS.escape('1a')") == L"true:function:8:\\31 a");
+            CHECK(p.Run(L"try { null.x } catch (e) { e.stack.indexOf(':1') > 0 }") == L"true");
+        }
+
+        // merJS: tembel ureteçler ve async ureteçler
+        {
+            Page p(L"<body></body>");
+            CHECK(p.Run(L"function* say() { let i = 0; while (true) yield i++; } const g = say(); g.next(); g.next(); g.next().value") == L"2");
+            CHECK(p.Run(L"function* ic() { const x = yield 1; yield x * 2; } const h = ic(); h.next(); h.next(21).value") == L"42");
+            CHECK(p.Run(L"let fin = 0; function* k() { try { yield 1; yield 2; } finally { fin++; } } for (const v of k()) break; fin") == L"1");
+            p.Run(L"var ag = ''; async function* ak() { yield 'x'; await null; yield 'y'; }"
+                  L"(async () => { for await (const v of ak()) ag += v; ag += '!'; })();");
+            CHECK(p.Run(L"ag") == L"xy!");
         }
     }
+    {
+        // Sekme yalitimi: baska is parcacigindan kesme bayragi sonsuz donguyu durdurur, calisma ortami kullanilabilir kalir
+        Page p(L"<html><body><p id=s>0</p></body></html>");
+        std::atomic<bool> stop{false};
+        p.rt.extInterrupt = &stop;
+        p.rt.stepBudget = 4000000000ull;
+        HANDLE th = CreateThread(nullptr, 0, [](LPVOID a) -> DWORD { Sleep(300); static_cast<std::atomic<bool>*>(a)->store(true); return 0; }, &stop, 0, nullptr);
+        ULONGLONG t0 = GetTickCount64();
+        std::wstring ab = p.Run(L"var x = 0; while (true) { x++; }");
+        ULONGLONG dt = GetTickCount64() - t0;
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+        CHECK(dt >= 250 && dt < 3000);
+        CHECK(ab.find(L"ABORT") == 0 && ab.find(L"durduruldu") != std::wstring::npos);
+        stop = false;
+        CHECK(p.Run(L"x > 1000") == L"true");
+        CHECK(p.Run(L"document.getElementById('s').textContent = 'tamam'; document.getElementById('s').textContent") == L"tamam");
+        // zamanlayici icinde de
+        p.Run(L"var z = 0; setTimeout(function(){ while (true) z++; }, 0); setTimeout(function(){ z = -1; }, 1);");
+        stop = true;
+        p.rt.RunDueTimers(p.rt.Now() + 10);
+        stop = false;
+        CHECK(p.Run(L"z > 0") == L"true");
+        // OverMemory: ana bilgisayar bellek siniri bildirirse uzun dongu durur
+        struct MemHost : TestHost { int calls = 0; bool OverMemory() override { return ++calls > 3; } };
+        Page q(L"<html><body></body></html>");
+        MemHost mh;
+        q.rt.AttachDocument(q.doc.get(), &mh);
+        q.rt.stepBudget = 4000000000ull;
+        std::wstring mr = q.Run(L"var a = []; while (true) { a.push({}); if (a.length > 1000) a = []; }");
+        CHECK(mr.find(L"ABORT") == 0 && mr.find(L"bellek") != std::wstring::npos && mh.calls > 3);
+    }
+    // Guvenlik regresyon testleri: HttpOnly cerez korumasi, CRLF enjeksiyonu, outerHTML script engeli, pano yalitimi
+    {
+        Page p(L"<body><div id=hedef><span>eski</span></div></body>");
+        js::Cookie ho;
+        ho.value = L"gizli_oturum";
+        ho.httpOnly = true;
+        p.rt.cookies[L"sid"] = ho;
+        CHECK(p.Run(L"document.cookie.indexOf('gizli_oturum')") == L"-1");
+        p.Run(L"document.cookie = 'sid=sahte; path=/'; document.cookie = 'sid=; max-age=0';");
+        CHECK(p.rt.cookies[L"sid"].value == L"gizli_oturum");
+        p.Run(L"document.cookie = ' yeni=1; HttpOnly';");
+        CHECK(p.rt.cookies.count(L"yeni") == 0);
+        p.Run(L"document.cookie = 'crlf=1\\r\\nSet-Cookie: kotu=2';");
+        CHECK(p.rt.cookies.count(L"crlf") == 0 && p.rt.cookies.count(L"kotu") == 0);
+
+        // outerHTML ve insertAdjacentHTML <script> calistirmamali
+        p.Run(L"window.xss = 0; document.getElementById('hedef').firstChild.outerHTML = '<script>window.xss = 1;</script>';"
+              L"document.getElementById('hedef').insertAdjacentHTML('beforeend', '<script>window.xss = 2;</script>');");
+        CHECK(p.Run(L"window.xss") == L"0");
+
+        // Pano sekme yalitimi
+        p.Run(L"navigator.clipboard.writeText('sekme1_ozel');");
+        Page p2(L"<body></body>");
+        p2.Run(L"var okunan = 'bas'; navigator.clipboard.readText().then(t => { okunan = t; });");
+        CHECK(p2.Run(L"okunan") == L"");
+    }
     std::printf(fails ? "%d HATA\n" : "TUM DOM TESTLERI GECTI\n", fails);
+    std::fflush(stdout);
     return fails ? 1 : 0;
 }

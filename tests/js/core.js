@@ -278,6 +278,97 @@ af().then(v => { asyncResult = v; });
 const allP = Promise.all([1, Promise.resolve(2), new Promise(r => r(3))]).then(v => order.push("all:" + v.join("")));
 new Promise((_, rej) => rej(new Error("x"))).catch(e => order.push("caught:" + e.message));
 
+// Etiketli sablon: ayni cagri noktasi ayni dondurulmus dizgi dizisi (lit-html onbellegi buna dayanir)
+function etiket(s) { return s; }
+const sablonAl = (x) => etiket`a${x}b`;
+eq(sablonAl(1) === sablonAl(2), true, "sablon kimligi");
+eq(Object.isFrozen(sablonAl(1)) && Object.isFrozen(sablonAl(1).raw), true, "sablon donmus");
+eq(etiket`a${1}b` === etiket`a${1}b`, false, "farkli cagri noktasi");
+
+// Ayristirici: sablon ifadesinde regex, if/for basligindan sonra regex (YouTube kevlar hatasi)
+const kacis = (v) => `"${v.replace(/\\/g, `\\\\`).replace(/"/g, `\\"`)}"`;
+eq(kacis('a"b'), '"a\\"b"', "sablonda regex");
+var sayim = 0; for (var ii = 0; ii < 3; ii++)/x/.test('x') && sayim++;
+eq(sayim, 3, "for basligindan sonra regex");
+if (true) /^a/.test('ab') ? sayim++ : 0;
+eq(sayim, 4, "if basligindan sonra regex");
+eq((4)/2/1, 2, "parantezden sonra bolme");
+// Regex Annex B: duz { }, sinif icinde [ ve \\w-
+eq(/a{b}/.test('a{b}'), true, "duz suslu");
+eq(/x{2}/.test('xx'), true, "niceleyici");
+eq(/[[.:#*]/.test(':'), true, "sinifta [");
+eq(/^[\w-\d]+$/.test('a-1'), true, "sinif kacisi yaninda -");
+eq(/(?:^[^;\-\s}]+)?--[^;{}]*?:[^{};]*?{[^}]*?}(?:[;\n]|$)?/.test('--x:{a}'), true, "ShadyCSS regex");
+
+// Dizi bosluklari (holes): YouTube kevlar d3 kodu Array(3).concat(...).map(f) kullanir
+(function () {
+var r = [];
+var a = Array(3).concat("x", "y");
+r.push(a.map(function (s) { return s.length; }).join("|"));
+r.push(a.length, 0 in a, 3 in a, Object.keys(a).join());
+var b = [1, , 3]; r.push(b.indexOf(undefined), b.includes(undefined), b.filter(function(){return true;}).length);
+var c = [1, 2, 3]; delete c[1]; r.push(c.length, 1 in c, c.reduce(function (s, x) { return s + x; }, 0));
+var cnt = 0; [, , 5].forEach(function () { cnt++; }); r.push(cnt);
+var d = []; d[3] = 1; r.push(d.length, 0 in d, [...d].join("-"), Array.from(d).length);
+var e = [3, , 1, undefined]; e.sort(); r.push(e.length, 3 in e, e[2] === undefined, 2 in e);
+r.push([1, [2, , 3]].flat().length, Array(2).join("-"), JSON.stringify([, 1]));
+var f = []; f.length = 2; r.push(0 in f, f.some(function(){return true;}));
+for (var k in [7, , 9]) r.push("k" + k);
+r.push(new Array(5).fill(0).join(""), [, 'a'].findIndex(function (x) { return x === undefined; }));
+eq(r.join(","), "|||1|1,5,false,true,3,4,-1,true,2,3,false,4,1,4,false,---1,4,4,false,true,true,3,-,[null,1],false,false,k0,k2,00000,0", "dizi bosluklari (V8 ile ayni)");
+})();
+
+// 'u' kipinde astral karakter siniflari (YouTube kevlar: /[\u{1D400}-\u{1D7FF}\u2100-\u214F]/u)
+(function () {
+var r = [];
+var re = /[\u{1D400}-\u{1D7FF}℀-⅏]/u;
+r.push(re.test('\u{1D400}'), re.test('\u{1D7FF}'), re.test('™'), re.test('a'), re.test('\u{1F600}'));
+var e = /[\u{1F600}-\u{1F64F}]/u; r.push(e.test('😀'), e.test('x'));
+var n = /^[^\u{1F600}-\u{1F64F}]$/u; r.push(n.test('😀'), n.test('a'), n.test('\u{10000}'));
+var w = /[\u{10000}-\u{10FFFF}a-c]/u; r.push(w.test('b'), w.test('\u{10FFFF}'), w.test('\u{20000}'), w.test('d'));
+r.push('a😀b😃'.replace(/[\u{1F600}-\u{1F64F}]/gu, '*'));
+eq(r.join(','), 'true,true,true,false,false,true,false,false,true,true,true,true,true,false,a*b*', 'u kipi astral sinif (V8 ile ayni)');
+})();
+
+// BigInt (YouTube oynatici base.js kullaniyor) - beklenen degerler V8'den
+(function () {
+var o = [];
+var a = new BigInt64Array(3); a[0] = -5n; a[1] = 2n ** 63n; a[2] = 123456789012345678901n;
+o.push(String(a[0]), String(a[1]), String(a[2]), a.BYTES_PER_ELEMENT);
+var b = new BigUint64Array(a.buffer); o.push(String(b[0]), String(b[1]));
+var dv = new DataView(new ArrayBuffer(16)); dv.setBigInt64(0, -2n); dv.setBigUint64(8, 0x0102030405060708n, true);
+o.push(String(dv.getBigInt64(0)), String(dv.getBigUint64(0)), String(dv.getBigUint64(8, true)), dv.getUint8(8));
+try { a[0] = 1; } catch (e) { o.push(e.name); }
+try { 1n + 1; } catch (e) { o.push(e.name); }
+o.push(typeof 10n, 10n > 9, 2n == 2, 2n === 2, 0x1fn + 1n + "", BigInt("0x10") + "", BigInt.asIntN(8, 255n) + "", BigInt.asUintN(64, -1n) + "",
+  (-7n / 2n) + "", (-7n % 2n) + "", (5n << 70n) + "", (-9n >> 1n) + "", (6n & -3n) + "", (255n).toString(16), 1n ? "t" : "f", 0n ? "t" : "f");
+eq(o.join("|"), "-5|-9223372036854775808|-5670419503621182411|8|18446744073709551611|9223372036854775808|-2|18446744073709551614|72623859790382856|8|TypeError|TypeError|bigint|true|true|false|32|16|-1|18446744073709551615|-3|-1|5902958103587056517120|-5|4|ff|t|f", "BigInt (V8 ile ayni)");
+})();
+
+// Polymer baglama regex'i (MSVC std::regex kacis/ayrac katiligi)
+(function () {
+var re = /(\[\[|{{)\s*(?:(!)\s*)?((?:[a-zA-Z_$][\w.:$\-*]*)\s*(?:\(\s*(?:(?:(?:((?:[a-zA-Z_$][\w.:$\-*]*)|(?:[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)|(?:(?:'(?:[^'\\]|\\.)*')|(?:"(?:[^"\\]|\\.)*")))\s*)(?:,\s*(?:((?:[a-zA-Z_$][\w.:$\-*]*)|(?:[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?)|(?:(?:'(?:[^'\\]|\\.)*')|(?:"(?:[^"\\]|\\.)*")))\s*))*)?)\)\s*)?)(?:]]|}})/g;
+var m = re.exec("x [[foo.bar]] y {{!baz(a, 'q')}}"); var m2 = re.exec("x [[foo.bar]] y {{!baz(a, 'q')}}");
+eq(m[3] + "|" + m2[2] + "|" + m2[3], "foo.bar|!|baz(a, 'q')", "Polymer baglama regex'i");
+})();
+
+// s += x hizli yolu (yerinde buyutme) anlamsal olarak ayni kalmali - beklenenler Node/V8'den
+(function () {
+function f1() { var s = 'a'; var t = s; s += 'b'; return t + '|' + s; }
+function f2() { var s = 'x'; var arr = [s]; s += 'y'; return arr[0] + '|' + s; }
+function f3() { var s = 'q'; s += (s = 'Z', '!'); return s; }
+function f4() { let s = ''; for (let i = 0; i < 5; i++) s += i; return s; }
+function f5() { const c = 'k'; try { c += 'x'; } catch (e) { return e.name; } }
+function f6() { var s = 'n'; s += { toString: function () { return 'T'; } }; s += 1; s += null; return s; }
+function f7() { var o = { s: 'm' }; with (o) { s += 'w'; } return o.s; }
+function f8() { var s = 'e'; var g = function () { return s; }; s += 'v'; return g() + s; }
+function f9() { var s = 'r'; var o = { v: s }; s += 'z'; return o.v + s + eval('var w = "a"; w += "b"; w'); }
+eq([f1(), f2(), f3(), f4(), f5(), f6(), f7(), f8(), f9()].join(','), 'a|ab,x|xy,q!,01234,TypeError,nT1null,mw,evev,rrzab', 's += x anlamsal');
+var big = ''; for (var i = 0; i < 20000; i++) big += 'ab'; eq(big.length + ':' + big.charCodeAt(39999), '40000:98', 'buyuk dize kurma');
+var re = /(\d+)-(\w+)/g, src = ''; for (var k = 0; k < 500; k++) src += k + '-ab '; var cnt = 0, mm; while ((mm = re.exec(src))) cnt++;
+eq(cnt + ':' + (re.exec('1-a') && 0), '500:0', 'regex exec dongusu');
+})();
+
 // eval ve Function
 eq(eval("1 + 2"), 3);
 eq(new Function("a", "b", "return a * b")(6, 7), 42);
