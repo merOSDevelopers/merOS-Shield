@@ -20,6 +20,7 @@ void Renumber(Node* n, Document& doc) {
         st.pop_back();
         c->id = doc.count++;
         for (auto& k : c->kids) st.push_back(k.get());
+        if (c->shadow) st.push_back(c->shadow.get());
     }
 }
 
@@ -53,7 +54,7 @@ std::vector<std::unique_ptr<Node>> ParseFragment(const std::wstring& html, Docum
 Node* NewNode(Document& doc, Node::Kind kind, const std::wstring& s) {
     std::unique_ptr<Node> n(new Node());
     n->kind = kind;
-    if (kind == Node::Text) n->text = s;
+    if (kind == Node::Text || kind == Node::Comment) n->text = s;
     else n->name = ToLower(s);
     n->id = doc.count++;
     Node* p = n.get();
@@ -86,8 +87,140 @@ std::unique_ptr<Node> Detach(Document& doc, Node* n) {
 }
 
 bool Contains(const Node* a, const Node* n) {
+    for (const Node* p = n; p; p = p->parent ? p->parent : (p->kind == Node::Shadow ? p->host : nullptr)) if (p == a) return true;
+    return false;
+}
+
+bool ContainsLight(const Node* a, const Node* n) {
     for (const Node* p = n; p; p = p->parent) if (p == a) return true;
     return false;
+}
+
+// ---------------- Shadow DOM ----------------
+
+Node* AttachShadowRoot(Document& doc, Node* host, uint8_t mode) {
+    if (!host || host->kind != Node::Elem || host->shadow) return nullptr;
+    std::unique_ptr<Node> s(new Node());
+    s->kind = Node::Shadow;
+    s->name = L"#shadow-root";
+    s->id = doc.count++;
+    s->host = host;
+    s->shadowMode = mode ? mode : 1;
+    host->shadow = std::move(s);
+    return host->shadow.get();
+}
+
+const Node* ComposedParent(const Node* n) {
+    if (!n) return nullptr;
+    if (n->parent) return n->parent;
+    return n->kind == Node::Shadow ? n->host : nullptr;
+}
+
+const Node* ShadowRootOf(const Node* n) {
+    for (const Node* p = n; p; p = p->parent) if (p->kind == Node::Shadow) return p;
+    return nullptr;
+}
+
+std::wstring SlotNameOf(const Node* n) {
+    if (n->kind != Node::Elem) return L"";
+    const std::wstring* s = n->Attr(L"slot");
+    return s ? *s : L"";
+}
+
+static const Node* FindSlot(const Node* root, const std::wstring& name) {
+    std::vector<const Node*> st;
+    for (size_t i = root->kids.size(); i-- > 0;) st.push_back(root->kids[i].get());
+    int guard = 0;
+    while (!st.empty() && guard++ < 200000) {
+        const Node* c = st.back();
+        st.pop_back();
+        if (c->kind != Node::Elem) continue;
+        if (c->name == L"slot") {
+            const std::wstring* nm = c->Attr(L"name");
+            if ((nm ? *nm : std::wstring()) == name) return c;
+        }
+        for (size_t i = c->kids.size(); i-- > 0;) st.push_back(c->kids[i].get());
+    }
+    return nullptr;
+}
+
+const Node* AssignedSlot(const Node* n) {
+    const Node* h = n ? n->parent : nullptr;
+    if (!h || !h->shadow) return nullptr;
+    if (n->kind != Node::Elem && n->kind != Node::Text) return nullptr;
+    return FindSlot(h->shadow.get(), SlotNameOf(n));
+}
+
+void AssignedNodes(const Node* slot, std::vector<const Node*>& out) {
+    const Node* root = ShadowRootOf(slot);
+    if (!root || !root->host) return;
+    const std::wstring* nm = slot->Attr(L"name");
+    std::wstring name = nm ? *nm : L"";
+    if (FindSlot(root, name) != slot) return;   // ayni adli ilk slot alir
+    for (auto& k : root->host->kids) {
+        if (k->kind != Node::Elem && k->kind != Node::Text) continue;
+        if (SlotNameOf(k.get()) == name) out.push_back(k.get());
+    }
+}
+
+void FlatKids(const Node* n, std::vector<const Node*>& out) {
+    if (n->shadow) {
+        for (auto& k : n->shadow->kids) out.push_back(k.get());
+        return;
+    }
+    if (n->kind == Node::Elem && n->name == L"slot" && ShadowRootOf(n)) {
+        size_t before = out.size();
+        AssignedNodes(n, out);
+        if (out.size() != before) return;
+    }
+    for (auto& k : n->kids) out.push_back(k.get());
+}
+
+std::vector<std::unique_ptr<Node>> TemplateNodes(Node* t, Document& doc) {
+    std::vector<std::unique_ptr<Node>> out;
+    bool raw = !t->kids.empty();
+    for (auto& k : t->kids) if (k->kind != Node::Text) { raw = false; break; }
+    if (raw) {
+        std::wstring html;
+        for (auto& k : t->kids) html += k->text;
+        // Dugumler asla silinmez (JS sarmalayicilari onlara isaret edebilir): havuza tasi
+        for (auto& k : t->kids) { k->parent = nullptr; doc.detached.push_back(std::move(k)); }
+        t->kids.clear();
+        out = ParseFragment(html, doc);
+    } else {
+        for (auto& k : t->kids) out.push_back(std::move(k));
+        t->kids.clear();
+    }
+    return out;
+}
+
+void ApplyDeclarativeShadow(Document& doc, Node* root) {
+    std::vector<Node*> st{root};
+    std::vector<Node*> templates;
+    int guard = 0;
+    while (!st.empty() && guard++ < kMaxNodes) {
+        Node* c = st.back();
+        st.pop_back();
+        if (c->kind == Node::Elem && c->name == L"template" && c->parent && c->parent->kind == Node::Elem && !c->parent->shadow) {
+            const std::wstring* mode = c->Attr(L"shadowrootmode");
+            if (!mode) mode = c->Attr(L"shadowroot");
+            if (mode) {
+                Node* s = AttachShadowRoot(doc, c->parent, ToLower(*mode) == L"closed" ? 2 : 1);
+                if (s) {
+                    for (auto& k : TemplateNodes(c, doc)) { k->parent = s; s->kids.push_back(std::move(k)); }
+                    templates.push_back(c);
+                    st.push_back(s);
+                    continue;
+                }
+            }
+        }
+        for (size_t i = c->kids.size(); i-- > 0;) st.push_back(c->kids[i].get());
+        if (c->shadow) st.push_back(c->shadow.get());
+    }
+    for (Node* t : templates) {
+        std::unique_ptr<Node> own = Detach(doc, t);
+        if (own) doc.detached.push_back(std::move(own));
+    }
 }
 
 static int Depth(const Node* n) {
@@ -102,6 +235,21 @@ bool InsertBefore(Document& doc, Node* parent, Node* child, Node* ref) {
     if (Depth(parent) >= int(kMaxDepth)) return false;
     if (ref && ref->parent != parent) return false;
     if (ref == child) return true;
+    if (child->name == L"#fragment") {
+        std::vector<std::unique_ptr<Node>> kids;
+        kids.swap(child->kids);
+        for (auto& kd : kids) {
+            kd->parent = parent;
+            if (!ref) {
+                parent->kids.push_back(std::move(kd));
+            } else {
+                auto it = parent->kids.begin();
+                while (it != parent->kids.end() && it->get() != ref) ++it;
+                parent->kids.insert(it, std::move(kd));
+            }
+        }
+        return true;
+    }
     std::unique_ptr<Node> own = Detach(doc, child);
     if (!own) return false;
     own->parent = parent;
@@ -138,11 +286,12 @@ std::wstring TextContent(const Node* n) {
 static void Ser(const Node* n, std::wstring& o, int depth) {
     if (depth > 400 || o.size() > 16000000) return;
     if (n->kind == Node::Text) {
-        bool raw = n->parent && (n->parent->name == L"script" || n->parent->name == L"style");
+        bool raw = n->parent && (n->parent->name == L"script" || n->parent->name == L"style" || n->parent->name == L"svg" || n->parent->name == L"math");
         o += raw ? n->text : HtmlEscape(n->text);
         return;
     }
-    if (n->kind == Node::Doc) { for (auto& k : n->kids) Ser(k.get(), o, depth + 1); return; }
+    if (n->kind == Node::Comment) { o += L"<!--"; o += n->text; o += L"-->"; return; }
+    if (n->kind == Node::Doc || n->kind == Node::Shadow) { for (auto& k : n->kids) Ser(k.get(), o, depth + 1); return; }
     o += L'<';
     o += n->name;
     for (auto& a : n->attrs) { o += L' '; o += a.first; o += L"=\""; o += HtmlEscape(a.second); o += L'"'; }

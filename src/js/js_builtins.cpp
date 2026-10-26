@@ -6,6 +6,7 @@
 #include <cwctype>
 #include <set>
 #include "js_ast.h"
+#include "js_bigint.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -44,8 +45,19 @@ double ToInteger(Runtime& rt, const Value& v) {
 }
 
 // Dizi benzeri nesneyi okuma: gercek dizi icin hizli yol
-std::vector<Value> ListOf(Runtime& rt, const Value& o) {
+// Bosluklari (holes) koruyan ham liste: concat/slice/reduce/indexOf gibi bosluk-duyarli metotlar icin
+std::vector<Value> ListOf(Runtime& rt, const Value& o);
+std::vector<Value> ListRaw(Runtime& rt, const Value& o) {
     if (o.IsObj() && (o.o->cls == Cls::Array || o.o->cls == Cls::Arguments)) return o.o->elems;
+    return ListOf(rt, o);
+}
+
+std::vector<Value> ListOf(Runtime& rt, const Value& o) {
+    if (o.IsObj() && (o.o->cls == Cls::Array || o.o->cls == Cls::Arguments)) {
+        std::vector<Value> out = o.o->elems;
+        for (auto& v : out) if (v.IsHole()) v = Value();
+        return out;
+    }
     if (o.IsStr()) return rt.IterateToList(o);
     Obj* obj = rt.ToObject(o);
     double n = ToInteger(rt, rt.Get(Value::O(obj), L"length"));
@@ -111,6 +123,11 @@ void CaseMap(std::wstring& s, bool upper) {
 std::wstring StrThis(Runtime& rt, const Value& thisV) {
     if (thisV.IsNullish()) rt.Throw(L"TypeError", L"String.prototype method called on null or undefined");
     return rt.ToStr(thisV);
+}
+// Kopyasiz: ilkel dizgede ayni paylasilan tampon (charCodeAt gibi yontemler her cagrida dizgeyi kopyalamasin)
+Str StrThisS(Runtime& rt, const Value& thisV) {
+    if (thisV.IsNullish()) rt.Throw(L"TypeError", L"String.prototype method called on null or undefined");
+    return rt.ToStrS(thisV);
 }
 
 // ================= Object =================
@@ -361,7 +378,9 @@ NATIVE(Array_ctor) {
     if (args.size() == 1 && A(0).IsNum()) {
         double n = A(0).n;
         if (n < 0 || n != std::floor(n) || n > 50000000) rt.Throw(L"RangeError", L"Invalid array length");
-        return Value::O(rt.NewArray(size_t(n)));
+        Obj* a = rt.NewArray(size_t(n));
+        for (auto& v : a->elems) v = Value::Hole();   // Array(n): n bosluk
+        return Value::O(a);
     }
     return Value::O(rt.NewArrayFrom(args));
 }
@@ -403,7 +422,7 @@ NATIVE(ArrayP_pop) {
     UNUSED;
     Obj* a = ArrThis(rt, thisV, L"pop");
     if (a->elems.empty()) return Value();
-    Value v = a->elems.back();
+    Value v = Unhole(a->elems.back());
     a->elems.pop_back();
     return v;
 }
@@ -411,7 +430,7 @@ NATIVE(ArrayP_shift) {
     UNUSED;
     Obj* a = ArrThis(rt, thisV, L"shift");
     if (a->elems.empty()) return Value();
-    Value v = a->elems.front();
+    Value v = Unhole(a->elems.front());
     a->elems.erase(a->elems.begin());
     return v;
 }
@@ -423,7 +442,7 @@ NATIVE(ArrayP_unshift) {
 }
 NATIVE(ArrayP_slice) {
     UNUSED;
-    std::vector<Value> l = ListOf(rt, thisV);
+    std::vector<Value> l = ListRaw(rt, thisV);
     size_t s = RelIndex(rt, A(0), l.size(), 0), e = RelIndex(rt, A(1), l.size(), l.size());
     std::vector<Value> out;
     if (s < e) out.assign(l.begin() + long(s), l.begin() + long(e));
@@ -442,9 +461,9 @@ NATIVE(ArrayP_splice) {
 }
 NATIVE(ArrayP_concat) {
     UNUSED;
-    std::vector<Value> out = ListOf(rt, thisV);
+    std::vector<Value> out = ListRaw(rt, thisV);
     for (auto& v : args) {
-        if (v.IsObj() && v.o->cls == Cls::Array) out.insert(out.end(), v.o->elems.begin(), v.o->elems.end());
+        if (v.IsObj() && v.o->cls == Cls::Array) out.insert(out.end(), v.o->elems.begin(), v.o->elems.end());   // bosluklar korunur
         else out.push_back(v);
         if (out.size() > 50000000) rt.Throw(L"RangeError", L"Invalid array length");
     }
@@ -470,14 +489,14 @@ NATIVE(ArrayP_toString) {
 NATIVE(ArrayP_reverse) { UNUSED; Obj* a = ArrThis(rt, thisV, L"reverse"); std::reverse(a->elems.begin(), a->elems.end()); return thisV; }
 NATIVE(ArrayP_indexOf) {
     UNUSED;
-    std::vector<Value> l = ListOf(rt, thisV);
-    for (size_t i = RelIndex(rt, A(1), l.size(), 0); i < l.size(); i++) if (rt.StrictEq(l[i], A(0))) return Value::N(double(i));
+    std::vector<Value> l = ListRaw(rt, thisV);
+    for (size_t i = RelIndex(rt, A(1), l.size(), 0); i < l.size(); i++) if (!l[i].IsHole() && rt.StrictEq(l[i], A(0))) return Value::N(double(i));
     return Value::N(-1);
 }
 NATIVE(ArrayP_lastIndexOf) {
     UNUSED;
-    std::vector<Value> l = ListOf(rt, thisV);
-    for (size_t i = l.size(); i-- > 0;) if (rt.StrictEq(l[i], A(0))) return Value::N(double(i));
+    std::vector<Value> l = ListRaw(rt, thisV);
+    for (size_t i = l.size(); i-- > 0;) if (!l[i].IsHole() && rt.StrictEq(l[i], A(0))) return Value::N(double(i));
     return Value::N(-1);
 }
 NATIVE(ArrayP_includes) {
@@ -488,13 +507,19 @@ NATIVE(ArrayP_includes) {
 }
 
 // Geri cagirmali dizi metotlari icin ortak yardimci
+// skipHoles: forEach/map/filter/some/every bosluklari atlar; find/findIndex atlamaz (spesifikasyon)
 template <class F>
-void EachCb(Runtime& rt, const Value& thisV, std::vector<Value>& args, F f) {
+void EachCb(Runtime& rt, const Value& thisV, std::vector<Value>& args, F f, bool skipHoles = true) {
     if (!IsCallable(A(0))) rt.Throw(L"TypeError", rt.TypeOf(A(0)) + L" is not a function");
-    std::vector<Value> l = ListOf(rt, thisV);
+    std::vector<Value> l = ListRaw(rt, thisV);
+    bool isArr = thisV.IsObj() && thisV.o->cls == Cls::Array;
     for (size_t i = 0; i < l.size(); i++) {
         // dizi ozgun ise canli oku (geri cagri diziyi degistirebilir)
-        Value v = (thisV.IsObj() && thisV.o->cls == Cls::Array) ? (i < thisV.o->elems.size() ? thisV.o->elems[i] : Value()) : l[i];
+        Value v = isArr ? (i < thisV.o->elems.size() ? thisV.o->elems[i] : Value::Hole()) : l[i];
+        if (v.IsHole()) {
+            if (skipHoles) continue;
+            v = Value();
+        }
         std::vector<Value> a{v, Value::N(double(i)), thisV};
         Value r = rt.Call(A(0), A(1), a);
         if (!f(v, i, r)) break;
@@ -504,8 +529,9 @@ void EachCb(Runtime& rt, const Value& thisV, std::vector<Value>& args, F f) {
 NATIVE(ArrayP_forEach) { UNUSED; EachCb(rt, thisV, args, [](const Value&, size_t, const Value&) { return true; }); return Value(); }
 NATIVE(ArrayP_map) {
     UNUSED;
-    std::vector<Value> out;
-    EachCb(rt, thisV, args, [&](const Value&, size_t, const Value& r) { out.push_back(r); return true; });
+    // sonuc ayni uzunlukta; kaynaktaki bosluklar sonucta da bosluk kalir
+    std::vector<Value> out(ListRaw(rt, thisV).size(), Value::Hole());
+    EachCb(rt, thisV, args, [&](const Value&, size_t i, const Value& r) { if (i < out.size()) out[i] = Unhole(r); return true; });
     return Value::O(rt.NewArrayFrom(out));
 }
 NATIVE(ArrayP_filter) {
@@ -529,13 +555,13 @@ NATIVE(ArrayP_every) {
 NATIVE(ArrayP_find) {
     UNUSED;
     Value out;
-    EachCb(rt, thisV, args, [&](const Value& v, size_t, const Value& r) { if (rt.Truthy(r)) { out = v; return false; } return true; });
+    EachCb(rt, thisV, args, [&](const Value& v, size_t, const Value& r) { if (rt.Truthy(r)) { out = v; return false; } return true; }, false);
     return out;
 }
 NATIVE(ArrayP_findIndex) {
     UNUSED;
     double out = -1;
-    EachCb(rt, thisV, args, [&](const Value&, size_t i, const Value& r) { if (rt.Truthy(r)) { out = double(i); return false; } return true; });
+    EachCb(rt, thisV, args, [&](const Value&, size_t i, const Value& r) { if (rt.Truthy(r)) { out = double(i); return false; } return true; }, false);
     return Value::N(out);
 }
 NATIVE(ArrayP_findLast) {
@@ -559,16 +585,18 @@ NATIVE(ArrayP_findLastIndex) {
 NATIVE(ArrayP_reduce) {
     UNUSED;
     if (!IsCallable(A(0))) rt.Throw(L"TypeError", L"reduce callback is not a function");
-    std::vector<Value> l = ListOf(rt, thisV);
+    std::vector<Value> l = ListRaw(rt, thisV);
     size_t i = 0;
     Value acc;
     if (args.size() >= 2) acc = A(1);
     else {
-        if (l.empty()) rt.Throw(L"TypeError", L"Reduce of empty array with no initial value");
-        acc = l[0];
-        i = 1;
+        while (i < l.size() && l[i].IsHole()) i++;
+        if (i >= l.size()) rt.Throw(L"TypeError", L"Reduce of empty array with no initial value");
+        acc = l[i];
+        i++;
     }
     for (; i < l.size(); i++) {
+        if (l[i].IsHole()) continue;
         std::vector<Value> a{acc, l[i], Value::N(double(i)), thisV};
         acc = rt.Call(A(0), Value(), a);
     }
@@ -577,16 +605,18 @@ NATIVE(ArrayP_reduce) {
 NATIVE(ArrayP_reduceRight) {
     UNUSED;
     if (!IsCallable(A(0))) rt.Throw(L"TypeError", L"reduceRight callback is not a function");
-    std::vector<Value> l = ListOf(rt, thisV);
+    std::vector<Value> l = ListRaw(rt, thisV);
     long i = long(l.size()) - 1;
     Value acc;
     if (args.size() >= 2) acc = A(1);
     else {
-        if (l.empty()) rt.Throw(L"TypeError", L"Reduce of empty array with no initial value");
+        while (i >= 0 && l[size_t(i)].IsHole()) i--;
+        if (i < 0) rt.Throw(L"TypeError", L"Reduce of empty array with no initial value");
         acc = l[size_t(i)];
         i--;
     }
     for (; i >= 0; i--) {
+        if (l[size_t(i)].IsHole()) continue;
         std::vector<Value> a{acc, l[size_t(i)], Value::N(double(i)), thisV};
         acc = rt.Call(A(0), Value(), a);
     }
@@ -598,7 +628,8 @@ NATIVE(ArrayP_sort) {
     Value cmp = A(0);
     std::vector<Value> v = a->elems, undefs;
     std::vector<Value> defined;
-    for (auto& x : v) (x.IsUndef() ? undefs : defined).push_back(x);
+    size_t holes = 0;
+    for (auto& x : v) { if (x.IsHole()) holes++; else (x.IsUndef() ? undefs : defined).push_back(x); }
     if (IsCallable(cmp)) {
         std::stable_sort(defined.begin(), defined.end(), [&](const Value& x, const Value& y) {
             std::vector<Value> ca{x, y};
@@ -613,6 +644,7 @@ NATIVE(ArrayP_sort) {
         for (auto& k : keyed) defined.push_back(k.second);
     }
     defined.insert(defined.end(), undefs.begin(), undefs.end());
+    defined.insert(defined.end(), holes, Value::Hole());   // bosluklar en sona
     a->elems = defined;
     return thisV;
 }
@@ -638,6 +670,7 @@ NATIVE(ArrayP_entries) {
 }
 void Flatten(Runtime& rt, const std::vector<Value>& in, double depth, std::vector<Value>& out) {
     for (auto& v : in) {
+        if (v.IsHole()) continue;   // flat bosluklari atar
         if (depth > 0 && v.IsObj() && v.o->cls == Cls::Array) Flatten(rt, v.o->elems, depth - 1, out);
         else out.push_back(v);
         if (out.size() > 50000000) rt.Throw(L"RangeError", L"Invalid array length");
@@ -646,7 +679,7 @@ void Flatten(Runtime& rt, const std::vector<Value>& in, double depth, std::vecto
 NATIVE(ArrayP_flat) {
     UNUSED;
     std::vector<Value> out;
-    Flatten(rt, ListOf(rt, thisV), A(0).IsUndef() ? 1 : std::min(ToInteger(rt, A(0)), 100.0), out);
+    Flatten(rt, ListRaw(rt, thisV), A(0).IsUndef() ? 1 : std::min(ToInteger(rt, A(0)), 100.0), out);
     return Value::O(rt.NewArrayFrom(out));
 }
 NATIVE(ArrayP_flatMap) {
@@ -664,6 +697,61 @@ NATIVE(ArrayP_at) {
     if (i < 0) i += double(l.size());
     if (i < 0 || i >= double(l.size())) return Value();
     return l[size_t(i)];
+}
+NATIVE(ArrayP_toReversed) {
+    UNUSED;
+    std::vector<Value> l = ListOf(rt, thisV);
+    std::reverse(l.begin(), l.end());
+    return Value::O(rt.NewArrayFrom(l));
+}
+NATIVE(ArrayP_toSorted) {
+    UNUSED;
+    std::vector<Value> l = ListOf(rt, thisV);
+    Value cmp = A(0);
+    if (!cmp.IsUndef() && !IsCallable(cmp)) rt.Throw(L"TypeError", L"The comparison function must be either a function or undefined");
+    if (IsCallable(cmp)) {
+        std::stable_sort(l.begin(), l.end(), [&](const Value& a, const Value& b) {
+            std::vector<Value> args2{a, b};
+            double r = rt.ToNum(rt.Call(cmp, Value(), args2));
+            return r < 0;
+        });
+    } else {
+        std::stable_sort(l.begin(), l.end(), [&](const Value& a, const Value& b) {
+            return rt.ToStr(a) < rt.ToStr(b);
+        });
+    }
+    return Value::O(rt.NewArrayFrom(l));
+}
+NATIVE(ArrayP_toSpliced) {
+    UNUSED;
+    std::vector<Value> l = ListOf(rt, thisV);
+    double len = double(l.size());
+    double start = ToInteger(rt, A(0));
+    double actualStart = (start < 0) ? std::max(len + start, 0.0) : std::min(start, len);
+    double actualDeleteCount = 0;
+    if (args.size() == 1) {
+        actualDeleteCount = len - actualStart;
+    } else if (args.size() >= 2) {
+        double dc = ToInteger(rt, A(1));
+        actualDeleteCount = std::max(0.0, std::min(dc, len - actualStart));
+    }
+    std::vector<Value> out;
+    size_t sIdx = size_t(actualStart);
+    size_t del = size_t(actualDeleteCount);
+    for (size_t i = 0; i < sIdx && i < l.size(); i++) out.push_back(l[i]);
+    for (size_t i = 2; i < args.size(); i++) out.push_back(args[i]);
+    for (size_t i = sIdx + del; i < l.size(); i++) out.push_back(l[i]);
+    return Value::O(rt.NewArrayFrom(out));
+}
+NATIVE(ArrayP_with) {
+    UNUSED;
+    std::vector<Value> l = ListOf(rt, thisV);
+    double len = double(l.size());
+    double relativeIndex = ToInteger(rt, A(0));
+    double actualIndex = (relativeIndex >= 0) ? relativeIndex : len + relativeIndex;
+    if (actualIndex < 0 || actualIndex >= len) rt.Throw(L"RangeError", L"Invalid index in Array.prototype.with");
+    l[size_t(actualIndex)] = A(1);
+    return Value::O(rt.NewArrayFrom(l));
 }
 
 // ================= String =================
@@ -717,21 +805,21 @@ NATIVE(StringP_toString) {
 }
 NATIVE(StringP_charAt) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double i = ToInteger(rt, A(0));
     if (i < 0 || i >= double(s.size())) return Value::S(L"");
     return Value::S(std::wstring(1, s[size_t(i)]));
 }
 NATIVE(StringP_charCodeAt) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double i = ToInteger(rt, A(0));
     if (i < 0 || i >= double(s.size())) return Value::N(NAN);
     return Value::N(double(uint16_t(s[size_t(i)])));
 }
 NATIVE(StringP_codePointAt) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double i = ToInteger(rt, A(0));
     if (i < 0 || i >= double(s.size())) return Value();
     uint32_t c = uint32_t(s[size_t(i)]);
@@ -743,20 +831,20 @@ NATIVE(StringP_codePointAt) {
 }
 NATIVE(StringP_indexOf) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV), f = rt.ToStr(A(0));
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_; std::wstring f = rt.ToStr(A(0));
     size_t from = size_t(std::max(0.0, std::min(ToInteger(rt, A(1)), double(s.size()))));
     size_t p = s.find(f, from);
     return Value::N(p == std::wstring::npos ? -1 : double(p));
 }
 NATIVE(StringP_lastIndexOf) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV), f = rt.ToStr(A(0));
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_; std::wstring f = rt.ToStr(A(0));
     size_t p = s.rfind(f);
     return Value::N(p == std::wstring::npos ? -1 : double(p));
 }
 NATIVE(StringP_includes) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     if (A(0).IsObj() && A(0).o->cls == Cls::RegExp) rt.Throw(L"TypeError", L"First argument must not be a regular expression");
     std::wstring f = rt.ToStr(A(0));
     size_t from = size_t(std::max(0.0, std::min(ToInteger(rt, A(1)), double(s.size()))));
@@ -764,26 +852,26 @@ NATIVE(StringP_includes) {
 }
 NATIVE(StringP_startsWith) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV), f = rt.ToStr(A(0));
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_; std::wstring f = rt.ToStr(A(0));
     size_t pos = size_t(std::max(0.0, std::min(ToInteger(rt, A(1)), double(s.size()))));
     return Value::B(s.compare(pos, f.size(), f) == 0 && pos + f.size() <= s.size());
 }
 NATIVE(StringP_endsWith) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV), f = rt.ToStr(A(0));
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_; std::wstring f = rt.ToStr(A(0));
     size_t end = A(1).IsUndef() ? s.size() : size_t(std::max(0.0, std::min(ToInteger(rt, A(1)), double(s.size()))));
     if (f.size() > end) return Value::B(false);
     return Value::B(s.compare(end - f.size(), f.size(), f) == 0);
 }
 NATIVE(StringP_slice) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     size_t a = RelIndex(rt, A(0), s.size(), 0), b = RelIndex(rt, A(1), s.size(), s.size());
     return Value::S(a < b ? s.substr(a, b - a) : L"");
 }
 NATIVE(StringP_substring) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double a = std::max(0.0, std::min(ToInteger(rt, A(0)), double(s.size())));
     double b = A(1).IsUndef() ? double(s.size()) : std::max(0.0, std::min(ToInteger(rt, A(1)), double(s.size())));
     if (a > b) std::swap(a, b);
@@ -791,7 +879,7 @@ NATIVE(StringP_substring) {
 }
 NATIVE(StringP_substr) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     size_t a = RelIndex(rt, A(0), s.size(), 0);
     double len = A(1).IsUndef() ? double(s.size()) : std::max(0.0, ToInteger(rt, A(1)));
     return Value::S(s.substr(a, size_t(std::min(len, double(s.size() - a)))));
@@ -801,7 +889,7 @@ NATIVE(StringP_toLowerCase) { UNUSED; std::wstring s = StrThis(rt, thisV); CaseM
 bool JsSpace(wchar_t c) { return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r' || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF || c == 0x2028 || c == 0x2029 || (c > 127 && iswspace(c)); }
 NATIVE(StringP_trim) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     size_t a = 0, b = s.size();
     while (a < b && JsSpace(s[a])) a++;
     while (b > a && JsSpace(s[b - 1])) b--;
@@ -810,7 +898,7 @@ NATIVE(StringP_trim) {
 NATIVE(StringP_trimStart) { UNUSED; std::wstring s = StrThis(rt, thisV); size_t a = 0; while (a < s.size() && JsSpace(s[a])) a++; return Value::S(s.substr(a)); }
 NATIVE(StringP_trimEnd) { UNUSED; std::wstring s = StrThis(rt, thisV); size_t b = s.size(); while (b > 0 && JsSpace(s[b - 1])) b--; return Value::S(s.substr(0, b)); }
 std::wstring Pad(Runtime& rt, const Value& thisV, std::vector<Value>& args, bool start) {
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double target = ToInteger(rt, A(0));
     std::wstring fill = A(1).IsUndef() ? L" " : rt.ToStr(A(1));
     if (target <= double(s.size()) || fill.empty()) return s;
@@ -824,7 +912,7 @@ NATIVE(StringP_padStart) { UNUSED; return Value::S(Pad(rt, thisV, args, true)); 
 NATIVE(StringP_padEnd) { UNUSED; return Value::S(Pad(rt, thisV, args, false)); }
 NATIVE(StringP_repeat) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double n = ToInteger(rt, A(0));
     if (n < 0 || std::isinf(n)) rt.Throw(L"RangeError", L"Invalid count value");
     if (double(s.size()) * n > 100000000) rt.Throw(L"RangeError", L"Invalid string length");
@@ -835,7 +923,7 @@ NATIVE(StringP_repeat) {
 NATIVE(StringP_concat) { UNUSED; std::wstring s = StrThis(rt, thisV); for (auto& a : args) s += rt.ToStr(a); return Value::S(std::move(s)); }
 NATIVE(StringP_at) {
     UNUSED;
-    std::wstring s = StrThis(rt, thisV);
+    Str sp_ = StrThisS(rt, thisV); const std::wstring& s = *sp_;
     double i = ToInteger(rt, A(0));
     if (i < 0) i += double(s.size());
     if (i < 0 || i >= double(s.size())) return Value();
@@ -873,7 +961,8 @@ NATIVE(StringP_iterator) { UNUSED; return Value::O(rt.MakeIteratorFromList(rt.It
 
 NATIVE(Number_ctor) {
     UNUSED;
-    double n = args.empty() ? 0 : rt.ToNum(A(0));
+    Value prim = args.empty() ? Value::N(0) : rt.ToPrimitive(A(0), 1);
+    double n = prim.IsBig() ? BigOf(prim).ToDouble() : (args.empty() ? 0 : rt.ToNum(prim));
     if (rt.nativeNewTarget) {
         Obj* o = rt.NewObject(rt.numberProto);
         o->cls = Cls::NumBox;
@@ -1102,7 +1191,7 @@ NATIVE(Error_ctor) {
     if (!A(0).IsUndef()) rt.DefineData(e, L"message", Value::S(rt.ToStr(A(0))), false);
     if (A(1).IsObj() && rt.HasProperty(A(1).o, L"cause")) rt.DefineData(e, L"cause", rt.Get(A(1), L"cause"), false);
     std::wstring nm = rt.ToStr(rt.Get(Value::O(e), L"name"));
-    rt.DefineData(e, L"stack", Value::S(nm + L": " + rt.ToStr(rt.Get(Value::O(e), L"message")) + L"\n    at <merJS>"), false);
+    rt.FillErrorStack(e, nm + L": " + rt.ToStr(rt.Get(Value::O(e), L"message")));
     return Value::O(e);
 }
 NATIVE(ErrorP_toString) {
@@ -1230,10 +1319,9 @@ struct JsonParser {
             size_t st = i;
             if (s[i] == L'-') i++;
             while (i < s.size() && ((s[i] >= L'0' && s[i] <= L'9') || s[i] == L'.' || s[i] == L'e' || s[i] == L'E' || s[i] == L'+' || s[i] == L'-')) i++;
-            std::string n(s.begin() + long(st), s.begin() + long(i));
-            char* end = nullptr;
-            double v = strtod(n.c_str(), &end);
-            if (end != n.c_str() + n.size()) Err();
+            wchar_t* end = nullptr;
+            double v = wcstod(s.c_str() + st, &end);
+            if (end != s.c_str() + i) Err();
             return Value::N(v);
         }
         Err();
@@ -1337,6 +1425,11 @@ struct JsonWriter {
             if (v.o->cls == Cls::NumBox) v = Value::N(v.o->x->num);
             else if (v.o->cls == Cls::StrBox) v = Value::S(v.o->x->str);
             else if (v.o->cls == Cls::BoolBox) v = Value::B(v.o->x->num != 0);
+        }
+        if (v.IsBig()) {
+            Value tj = rt.Get(v, L"toJSON");
+            if (IsCallable(tj)) { std::vector<Value> a{Value::S(key)}; v = rt.Call(tj, v, a); }
+            if (v.IsBig()) rt.Throw(L"TypeError", L"Do not know how to serialize a BigInt");
         }
         switch (v.t) {
         case Value::Null: out += L"null"; return true;
@@ -1452,6 +1545,98 @@ NATIVE(Global_queueMicrotask) {
     rt.Enqueue(A(0), {});
     return Value();
 }
+
+static Value CloneValueDeep(Runtime& rt, const Value& v, std::unordered_map<Obj*, Obj*>& seen) {
+    if (!v.IsObj()) return v;
+    Obj* o = v.o;
+    if (seen.count(o)) return Value::O(seen[o]);
+
+    if (o->cls == Cls::Array) {
+        Obj* clone = rt.NewArray();
+        seen[o] = clone;
+        for (auto& item : o->elems) clone->elems.push_back(CloneValueDeep(rt, item, seen));
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::Date && o->x) {
+        Obj* clone = rt.NewObject(rt.dateProto);
+        clone->cls = Cls::Date;
+        clone->X().num = o->x->num;
+        seen[o] = clone;
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::RegExp && o->x) {
+        Obj* clone = rt.NewObject(rt.regexpProto);
+        clone->cls = Cls::RegExp;
+        clone->X().str = o->x->str;
+        clone->X().flags = o->x->flags;
+        clone->X().re = o->x->re;
+        seen[o] = clone;
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::Map && o->x) {
+        Obj* clone = rt.NewObject(rt.mapProto);
+        clone->cls = Cls::Map;
+        seen[o] = clone;
+        for (size_t i = 0; i < o->x->entries.size(); i++) {
+            if (i < o->x->dead.size() && o->x->dead[i]) continue;
+            Value ck = CloneValueDeep(rt, o->x->entries[i].first, seen);
+            Value cv = CloneValueDeep(rt, o->x->entries[i].second, seen);
+            clone->X().entries.push_back({ck, cv});
+            clone->X().dead.push_back(false);
+        }
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::Set && o->x) {
+        Obj* clone = rt.NewObject(rt.setProto);
+        clone->cls = Cls::Set;
+        seen[o] = clone;
+        for (size_t i = 0; i < o->x->entries.size(); i++) {
+            if (i < o->x->dead.size() && o->x->dead[i]) continue;
+            Value ck = CloneValueDeep(rt, o->x->entries[i].first, seen);
+            clone->X().entries.push_back({ck, ck});
+            clone->X().dead.push_back(false);
+        }
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::ArrayBuffer && o->x && o->x->bufferData) {
+        Obj* clone = rt.NewObject(rt.arrayBufferProto);
+        clone->cls = Cls::ArrayBuffer;
+        clone->X().bufferData = std::make_shared<std::vector<uint8_t>>(*o->x->bufferData);
+        clone->X().byteLength = o->x->byteLength;
+        seen[o] = clone;
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::TypedArray && o->x) {
+        Value bufClone = CloneValueDeep(rt, Value::O(o->x->arrayBufferObj), seen);
+        Obj* clone = rt.NewObject(o->proto);
+        clone->cls = Cls::TypedArray;
+        clone->X().arrayBufferObj = bufClone.o;
+        clone->X().bufferData = bufClone.o->x->bufferData;
+        clone->X().byteOffset = o->x->byteOffset;
+        clone->X().byteLength = o->x->byteLength;
+        clone->X().typedLength = o->x->typedLength;
+        clone->X().typedKind = o->x->typedKind;
+        seen[o] = clone;
+        return Value::O(clone);
+    }
+    if (o->cls == Cls::Object) {
+        Obj* clone = rt.NewObject(rt.objectProto);
+        seen[o] = clone;
+        for (auto& k : rt.OwnKeys(o, true)) {
+            clone->props.Put(k).v = CloneValueDeep(rt, rt.Get(Value::O(o), k), seen);
+        }
+        return Value::O(clone);
+    }
+    rt.Throw(L"DOMException", L"DataCloneError: could not clone object");
+}
+
+NATIVE(Global_structuredClone) {
+    UNUSED;
+    if (args.empty()) rt.Throw(L"TypeError", L"structuredClone requires at least 1 argument");
+    std::unordered_map<Obj*, Obj*> seen;
+    return CloneValueDeep(rt, A(0), seen);
+}
+
 NATIVE(Global_eval) {
     UNUSED;
     if (!A(0).IsStr()) return A(0);
@@ -1623,6 +1808,25 @@ NATIVE(Promise_all) { UNUSED; return Combinator(rt, args, 0); }
 NATIVE(Promise_allSettled) { UNUSED; return Combinator(rt, args, 1); }
 NATIVE(Promise_race) { UNUSED; return Combinator(rt, args, 2); }
 NATIVE(Promise_any) { UNUSED; return Combinator(rt, args, 3); }
+NATIVE(Promise_withResolvers) {
+    UNUSED;
+    Obj* p = rt.NewPromise();
+    Obj* res = rt.NewObject();
+    res->props.Put(L"promise").v = Value::O(p);
+
+    Obj* flag = rt.NewObject();
+    flag->X().num = 0;
+
+    Obj* rf = rt.NewFunction(PromiseResolveFnImpl, L"resolve", 1);
+    rf->X().slots = {Value::O(p), Value::O(flag)};
+    res->props.Put(L"resolve").v = Value::O(rf);
+
+    Obj* jf = rt.NewFunction(PromiseRejectFnImpl, L"reject", 1);
+    jf->X().slots = {Value::O(p), Value::O(flag)};
+    res->props.Put(L"reject").v = Value::O(jf);
+
+    return Value::O(res);
+}
 
 // ================= Map / Set =================
 
@@ -1794,6 +1998,70 @@ Obj* Runtime::MakeIteratorFromList(std::vector<Value> list) {
     return it;
 }
 
+// ================= BigInt =================
+BigNum ThisBig(Runtime& rt, const Value& v) {
+    if (v.IsBig()) return BigOf(v);
+    if (v.IsObj()) { Value b = rt.Get(v, L"\x02big"); if (b.IsBig()) return BigOf(b); }
+    rt.Throw(L"TypeError", L"BigInt.prototype method called on incompatible receiver");
+}
+Value ToBigIntV(Runtime& rt, const Value& v0) {
+    Value v = rt.ToPrimitive(v0, 1);
+    switch (v.t) {
+    case Value::BigInt: return v;
+    case Value::Bool: return BigVal(BigNum::FromI64(v.b ? 1 : 0));
+    case Value::String: {
+        BigNum b;
+        if (!BigParse(*v.s, b)) rt.Throw(L"SyntaxError", L"Cannot convert " + *v.s + L" to a BigInt");
+        return BigVal(b);
+    }
+    case Value::Num:
+        if (!std::isfinite(v.n) || v.n != std::trunc(v.n))
+            rt.Throw(L"RangeError", L"The number " + Runtime::NumToStr(v.n) + L" cannot be converted to a BigInt because it is not an integer");
+        return BigVal(BigNum::FromDouble(v.n));
+    default:
+        rt.Throw(L"TypeError", L"Cannot convert " + rt.ToStr(v.t == Value::Symbol ? Value::S(L"Symbol") : v) + L" to a BigInt");
+    }
+}
+NATIVE(BigInt_fn) {
+    UNUSED;
+    if (rt.nativeNewTarget) rt.Throw(L"TypeError", L"BigInt is not a constructor");
+    return ToBigIntV(rt, A(0));
+}
+size_t BitsArg(Runtime& rt, const Value& v) {
+    double d = ToInteger(rt, v);
+    if (d < 0 || d > 9007199254740991.0) rt.Throw(L"RangeError", L"Invalid value: not (convertible to) a safe integer");
+    if (d > 1000000) rt.Throw(L"RangeError", L"Maximum BigInt size exceeded");
+    return size_t(d);
+}
+NATIVE(BigInt_asUintN) { UNUSED; size_t bits = BitsArg(rt, A(0)); return BigVal(BigAsUintN(BigOf(ToBigIntV(rt, A(1))), bits)); }
+NATIVE(BigInt_asIntN) { UNUSED; size_t bits = BitsArg(rt, A(0)); return BigVal(BigAsIntN(BigOf(ToBigIntV(rt, A(1))), bits)); }
+NATIVE(BigIntP_toString) {
+    UNUSED;
+    BigNum b = ThisBig(rt, thisV);
+    int radix = A(0).IsUndef() ? 10 : int(ToInteger(rt, A(0)));
+    if (radix < 2 || radix > 36) rt.Throw(L"RangeError", L"toString() radix must be between 2 and 36");
+    return Value::S(BigToString(b, radix));
+}
+NATIVE(BigIntP_valueOf) { UNUSED; return BigVal(ThisBig(rt, thisV)); }
+
+void InstallBigInt(Runtime& rt) {
+    rt.bigintProto = rt.NewObject(rt.objectProto);
+    Obj* c = rt.NewFunction(BigInt_fn, L"BigInt", 1, true);
+    Prop& pp = c->props.Put(L"prototype");
+    pp.v = Value::O(rt.bigintProto);
+    pp.enumerable = false;
+    pp.writable = false;
+    rt.DefineData(rt.bigintProto, L"constructor", Value::O(c), false);
+    rt.DefineMethod(c, L"asUintN", BigInt_asUintN, 2);
+    rt.DefineMethod(c, L"asIntN", BigInt_asIntN, 2);
+    rt.DefineMethod(rt.bigintProto, L"toString", BigIntP_toString, 0);
+    rt.DefineMethod(rt.bigintProto, L"toLocaleString", BigIntP_toString, 0);
+    rt.DefineMethod(rt.bigintProto, L"valueOf", BigIntP_valueOf, 0);
+    rt.DefineData(rt.bigintProto, L"\x01Symbol.toStringTag", Value::S(L"BigInt"), false);
+    rt.DefineData(rt.global, L"BigInt", Value::O(c), false);
+    rt.ctors[L"BigInt"] = c;
+}
+
 void InstallBuiltins(Runtime& rt) {
     Obj* g = rt.global;
     auto M = [&](Obj* o, const wchar_t* n, NativeFn f, int len) { rt.DefineMethod(o, n, f, len); };
@@ -1877,7 +2145,12 @@ void InstallBuiltins(Runtime& rt) {
     M(AP, L"reduce", ArrayP_reduce, 1); M(AP, L"reduceRight", ArrayP_reduceRight, 1); M(AP, L"sort", ArrayP_sort, 1);
     M(AP, L"fill", ArrayP_fill, 1); M(AP, L"keys", ArrayP_keys, 0); M(AP, L"values", ArrayP_values, 0);
     M(AP, L"entries", ArrayP_entries, 0); M(AP, L"flat", ArrayP_flat, 0); M(AP, L"flatMap", ArrayP_flatMap, 1);
-    M(AP, L"at", ArrayP_at, 1); M(AP, L"toString", ArrayP_toString, 0); M(AP, L"toLocaleString", ArrayP_toString, 0);
+    M(AP, L"at", ArrayP_at, 1);
+    M(AP, L"toReversed", ArrayP_toReversed, 0);
+    M(AP, L"toSorted", ArrayP_toSorted, 1);
+    M(AP, L"toSpliced", ArrayP_toSpliced, 2);
+    M(AP, L"with", ArrayP_with, 2);
+    M(AP, L"toString", ArrayP_toString, 0); M(AP, L"toLocaleString", ArrayP_toString, 0);
     rt.DefineData(AP, kIter, rt.Get(Value::O(AP), L"values"), false);
 
     // String
@@ -1983,12 +2256,14 @@ void InstallBuiltins(Runtime& rt) {
     M(g, L"clearTimeout", Global_clearTimeout, 1);
     M(g, L"clearInterval", Global_clearTimeout, 1);
     M(g, L"queueMicrotask", Global_queueMicrotask, 1);
+    M(g, L"structuredClone", Global_structuredClone, 1);
     M(g, L"eval", Global_eval, 1);
 
     // Promise
     Obj* PC = MakeCtor(rt, L"Promise", Promise_ctor, 1, rt.promiseProto);
     M(PC, L"resolve", Promise_resolve, 1); M(PC, L"reject", Promise_reject, 1); M(PC, L"all", Promise_all, 1);
     M(PC, L"allSettled", Promise_allSettled, 1); M(PC, L"race", Promise_race, 1); M(PC, L"any", Promise_any, 1);
+    M(PC, L"withResolvers", Promise_withResolvers, 0);
     M(rt.promiseProto, L"then", PromiseP_then, 2); M(rt.promiseProto, L"catch", PromiseP_catch, 1);
     M(rt.promiseProto, L"finally", PromiseP_finally, 1);
     rt.DefineData(rt.promiseProto, L"\x01Symbol.toStringTag", Value::S(L"Promise"), false);

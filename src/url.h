@@ -22,5 +22,7 @@ Url ParseUrl(const std::wstring& s);
 std::wstring ResolveUrl(const std::wstring& base, const std::wstring& rel);
 bool HasScheme(const std::wstring& s, std::wstring* scheme);
 std::wstring UrlEncodeComponent(const std::wstring& s);
+bool IsSameOrigin(const Url& a, const Url& b);
+bool IsPrivateOrLocalHost(const std::wstring& host);
 
 } // namespace mer

@@ -14,9 +14,16 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "shlwapi.lib")
 
+#ifdef __MINGW32__
+// MinGW basliklarinda eksik (Windows 7+ mfplat.dll'de mevcut)
+extern "C" HRESULT WINAPI MFCreateMFByteStreamOnStream(IStream* pStream, IMFByteStream** ppByteStream);
+#endif
+
 namespace mer {
 
 static std::atomic<int> s_wmfCount{0};
+static constexpr UINT32 kMaxVideoDimension = 8192;
+static constexpr size_t kMaxVideoBufferBytes = 128u * 1024 * 1024;
 
 VideoDecoder::VideoDecoder() {
     initialized_ = Startup();
@@ -47,7 +54,7 @@ void VideoDecoder::Shutdown() {
 }
 
 bool VideoDecoder::DecodeBuffer(const uint8_t* data, size_t size, VideoFrame& outFrame) {
-    if (!data || size == 0) return false;
+    if (!data || size == 0 || size > kMaxVideoBufferBytes) return false;
     if (!initialized_) initialized_ = Startup();
     if (!initialized_) return false;
 
@@ -107,6 +114,11 @@ bool VideoDecoder::DecodeBuffer(const uint8_t* data, size_t size, VideoFrame& ou
         width = 640;
         height = 360;
     }
+    if (width > kMaxVideoDimension || height > kMaxVideoDimension) {
+        pSample->Release();
+        pReader->Release();
+        return false;
+    }
 
     IMFMediaBuffer* pBuffer = nullptr;
     hr = pSample->ConvertToContiguousBuffer(&pBuffer);
@@ -115,15 +127,18 @@ bool VideoDecoder::DecodeBuffer(const uint8_t* data, size_t size, VideoFrame& ou
         DWORD maxLength = 0, currentLength = 0;
         hr = pBuffer->Lock(&pData, &maxLength, &currentLength);
         if (SUCCEEDED(hr) && pData && currentLength > 0) {
-            outFrame.width = width;
-            outFrame.height = height;
-            outFrame.timestamp = static_cast<uint64_t>(llTimeStamp);
-            outFrame.bgra.resize(width * height * 4);
+            size_t frameBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+            if (frameBytes <= kMaxVideoBufferBytes) {
+                outFrame.width = width;
+                outFrame.height = height;
+                outFrame.timestamp = static_cast<uint64_t>(llTimeStamp);
+                outFrame.bgra.resize(frameBytes);
 
-            size_t copyLen = (std::min)(static_cast<size_t>(currentLength), outFrame.bgra.size());
-            memcpy(outFrame.bgra.data(), pData, copyLen);
+                size_t copyLen = (std::min)(static_cast<size_t>(currentLength), outFrame.bgra.size());
+                memcpy(outFrame.bgra.data(), pData, copyLen);
+                outFrame.valid = true;
+            }
             pBuffer->Unlock();
-            outFrame.valid = true;
         }
         pBuffer->Release();
     }
@@ -180,6 +195,11 @@ bool VideoDecoder::DecodeFile(const std::wstring& filePath, VideoFrame& outFrame
         pCurrentType->Release();
     }
     if (width == 0 || height == 0) { width = 640; height = 360; }
+    if (width > kMaxVideoDimension || height > kMaxVideoDimension) {
+        pSample->Release();
+        pReader->Release();
+        return false;
+    }
 
     IMFMediaBuffer* pBuffer = nullptr;
     hr = pSample->ConvertToContiguousBuffer(&pBuffer);
@@ -188,14 +208,17 @@ bool VideoDecoder::DecodeFile(const std::wstring& filePath, VideoFrame& outFrame
         DWORD maxLength = 0, currentLength = 0;
         hr = pBuffer->Lock(&pData, &maxLength, &currentLength);
         if (SUCCEEDED(hr) && pData && currentLength > 0) {
-            outFrame.width = width;
-            outFrame.height = height;
-            outFrame.timestamp = static_cast<uint64_t>(llTimeStamp);
-            outFrame.bgra.resize(width * height * 4);
-            size_t copyLen = (std::min)(static_cast<size_t>(currentLength), outFrame.bgra.size());
-            memcpy(outFrame.bgra.data(), pData, copyLen);
+            size_t frameBytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+            if (frameBytes <= kMaxVideoBufferBytes) {
+                outFrame.width = width;
+                outFrame.height = height;
+                outFrame.timestamp = static_cast<uint64_t>(llTimeStamp);
+                outFrame.bgra.resize(frameBytes);
+                size_t copyLen = (std::min)(static_cast<size_t>(currentLength), outFrame.bgra.size());
+                memcpy(outFrame.bgra.data(), pData, copyLen);
+                outFrame.valid = true;
+            }
             pBuffer->Unlock();
-            outFrame.valid = true;
         }
         pBuffer->Release();
     }
@@ -207,16 +230,16 @@ bool VideoDecoder::DecodeFile(const std::wstring& filePath, VideoFrame& outFrame
 
 VideoFrame VideoDecoder::CreatePlayerPreview(uint32_t width, uint32_t height, double currentTime, double duration) {
     VideoFrame frame;
-    frame.width = width ? width : 640;
-    frame.height = height ? height : 360;
+    frame.width = (width > 0 && width <= kMaxVideoDimension) ? width : 640;
+    frame.height = (height > 0 && height <= kMaxVideoDimension) ? height : 360;
     frame.valid = true;
-    frame.bgra.resize(frame.width * frame.height * 4);
+    frame.bgra.resize(static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height) * 4u);
 
     uint8_t* p = frame.bgra.data();
     // 1. Dark YouTube video canvas (#0f0f0f)
     for (uint32_t y = 0; y < frame.height; ++y) {
         for (uint32_t x = 0; x < frame.width; ++x) {
-            size_t idx = (y * frame.width + x) * 4;
+            size_t idx = (static_cast<size_t>(y) * frame.width + x) * 4;
             p[idx + 0] = 18; // B
             p[idx + 1] = 18; // G
             p[idx + 2] = 18; // R
@@ -239,7 +262,7 @@ VideoFrame VideoDecoder::CreatePlayerPreview(uint32_t width, uint32_t height, do
             int dy = (y < btnY + 8) ? (btnY + 8 - y) : (y > btnY + btnH - 8) ? (y - (btnY + btnH - 8)) : 0;
             if (dx * dx + dy * dy > 64) continue;
 
-            size_t idx = (y * frame.width + x) * 4;
+            size_t idx = (static_cast<size_t>(y) * frame.width + static_cast<size_t>(x)) * 4;
             // YouTube Red #FF0000
             p[idx + 0] = 0;
             p[idx + 1] = 0;
@@ -259,7 +282,7 @@ VideoFrame VideoDecoder::CreatePlayerPreview(uint32_t width, uint32_t height, do
         for (int32_t tx = 0; tx < span; ++tx) {
             int32_t colX = triX + tx;
             if (colX < 0 || colX >= static_cast<int32_t>(frame.width)) continue;
-            size_t idx = (rowY * frame.width + colX) * 4;
+            size_t idx = (static_cast<size_t>(rowY) * frame.width + static_cast<size_t>(colX)) * 4;
             p[idx + 0] = 255; // White
             p[idx + 1] = 255;
             p[idx + 2] = 255;
@@ -275,9 +298,9 @@ VideoFrame VideoDecoder::CreatePlayerPreview(uint32_t width, uint32_t height, do
     if (progressRatio > 1.0) progressRatio = 1.0;
     int32_t playedW = static_cast<int32_t>(progressRatio * frame.width);
 
-    for (int32_t by = barY; by < barY + barH && by < static_cast<int32_t>(frame.height); ++by) {
+    for (int32_t by = std::max<int32_t>(0, barY); by < barY + barH && by < static_cast<int32_t>(frame.height); ++by) {
         for (uint32_t bx = 0; bx < frame.width; ++bx) {
-            size_t idx = (by * frame.width + bx) * 4;
+            size_t idx = (static_cast<size_t>(by) * frame.width + bx) * 4;
             if (static_cast<int32_t>(bx) <= playedW) {
                 // Red progress
                 p[idx + 0] = 0;

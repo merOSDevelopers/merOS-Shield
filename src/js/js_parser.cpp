@@ -11,26 +11,58 @@ namespace js {
 
 namespace {
 
-constexpr int kMaxNest = 400;
+constexpr int kMaxNest = 1500;   // JS is parcaciklari 64 MB yiginla calisir
 
 enum TT : uint8_t { T_EOF, T_Ident, T_Num, T_Str, T_Tpl, T_Regex, T_Punct };
 
-struct Tok {
-    TT t = T_EOF;
-    std::wstring v;      // ad, dize degeri, noktalama, regex kaynagi
+// Sablon dizelerin ve duzenli ifadelerin ek verisi (cogu belirtecte yok: Tok kucuk kalir)
+struct TokExtra {
     std::wstring flags;  // regex bayraklari
-    double num = 0;
-    bool nl = false;     // oncesinde satir sonu var mi (ASI)
-    bool escaped = false;
-    int line = 1;
     std::vector<std::wstring> cooked, raws, exprs;
     std::vector<int> exprLines;
 };
 
-bool IsIdStart(wchar_t c) { return (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'$' || c == L'_' || c > 127; }
-bool IsIdPart(wchar_t c) { return IsIdStart(c) || (c >= L'0' && c <= L'9') || c == 0x200C || c == 0x200D; }
-bool IsLineTerm(wchar_t c) { return c == L'\n' || c == L'\r' || c == 0x2028 || c == 0x2029; }
-bool IsSpace(wchar_t c) { return c == L' ' || c == L'\t' || c == 0x0B || c == 0x0C || c == 0xA0 || c == 0xFEFF || (c > 127 && iswspace(c) && !IsLineTerm(c)); }
+struct Tok {
+    TT t = T_EOF;
+    bool nl = false;     // oncesinde satir sonu var mi (ASI)
+    bool escaped = false;
+    bool ctrl = false;   // ')' : if/for/while/with basligini kapatiyor (ardindan '/' duzenli ifadedir)
+    bool big = false;    // BigInt sabiti (123n): metni v'de
+    int line = 1;
+    uint32_t pos = 0;    // kaynaktaki baslangic konumu (tembel govdeler icin)
+    double num = 0;
+    std::wstring v;      // ad, dize degeri, noktalama, regex kaynagi
+    std::shared_ptr<TokExtra> ex;
+    TokExtra& X() { if (!ex) ex = std::make_shared<TokExtra>(); return *ex; }
+};
+
+// Hizli karsilastirma (wcslen yok): ilk karakter cogu zaman farkli
+inline bool StrEq(const std::wstring& a, const wchar_t* b) {
+    size_t n = a.size();
+    if (n == 0) return b[0] == 0;
+    if (a[0] != b[0]) return false;
+    for (size_t i = 1; i < n; i++) if (b[i] != a[i] || b[i] == 0) return false;
+    return b[n] == 0;
+}
+
+// ASCII karakter siniflari tablosu (1: tanimlayici basi, 2: tanimlayici devami, 4: bosluk)
+struct CharTable {
+    uint8_t c[128];
+    CharTable() {
+        for (int i = 0; i < 128; i++) {
+            uint8_t f = 0;
+            if ((i >= 'a' && i <= 'z') || (i >= 'A' && i <= 'Z') || i == '$' || i == '_') f |= 3;
+            if (i >= '0' && i <= '9') f |= 2;
+            if (i == ' ' || i == '\t' || i == 0x0B || i == 0x0C) f |= 4;
+            c[i] = f;
+        }
+    }
+};
+static const CharTable kCT;
+inline bool IsLineTerm(wchar_t c) { return c == L'\n' || c == L'\r' || c == 0x2028 || c == 0x2029; }
+inline bool IsIdStart(wchar_t c) { return c < 128 ? (kCT.c[c] & 1) != 0 : true; }
+inline bool IsIdPart(wchar_t c) { return c < 128 ? (kCT.c[c] & 2) != 0 : true; }   // 0x200C/0x200D de > 127
+inline bool IsSpace(wchar_t c) { return c < 128 ? (kCT.c[c] & 4) != 0 : (c == 0xA0 || c == 0xFEFF || (iswspace(c) && !IsLineTerm(c))); }
 
 int Hex(wchar_t c) {
     if (c >= L'0' && c <= L'9') return c - L'0';
@@ -61,6 +93,7 @@ public:
 
     std::vector<Tok> Run() {
         std::vector<Tok> out;
+        out.reserve(s_.size() / 5 + 16);
         bool nl = false;
         const size_t n = s_.size();
         while (true) {
@@ -84,6 +117,7 @@ public:
             Tok t;
             t.nl = nl;
             t.line = line_;
+            t.pos = uint32_t(i_);
             nl = false;
             atLineStart_ = false;
             if (i_ >= n) { t.t = T_EOF; out.push_back(t); break; }
@@ -91,7 +125,13 @@ public:
             wchar_t c = s_[i_];
             if (IsIdStart(c) || c == L'\\' || (c == L'#' && i_ + 1 < n && IsIdStart(s_[i_ + 1]))) {
                 std::wstring id;
-                if (c == L'#') { id += L'#'; i_++; }
+                // hizli yol: kacissiz tanimlayici tek seferde kopyalanir
+                {
+                    size_t st = i_, k = i_ + 1;
+                    while (k < n && IsIdPart(s_[k])) k++;
+                    if (c != L'\\' && (k >= n || s_[k] != L'\\')) { id.assign(s_, st, k - st); i_ = k; }
+                    else if (c == L'#') { id += L'#'; i_++; }
+                }
                 while (i_ < n) {
                     wchar_t d = s_[i_];
                     if (d == L'\\') {
@@ -106,10 +146,16 @@ public:
                     i_++;
                 }
                 t.t = T_Ident;
-                t.v = id;
+                t.v = std::move(id);
             } else if ((c >= L'0' && c <= L'9') || (c == L'.' && i_ + 1 < n && s_[i_ + 1] >= L'0' && s_[i_ + 1] <= L'9')) {
                 t.t = T_Num;
+                size_t numStart = i_;
                 t.num = ReadNumber();
+                if (lastBig_) {
+                    t.big = true;
+                    for (size_t k = numStart; k + 1 < i_; k++) if (s_[k] != L'_') t.v += s_[k];   // sondaki 'n' haric
+                    lastBig_ = false;
+                }
             } else if (c == L'"' || c == L'\'') {
                 t.t = T_Str;
                 t.v = ReadString(c);
@@ -122,18 +168,37 @@ public:
             } else {
                 t.t = T_Punct;
                 bool found = false;
-                for (int k = 0; kPuncts[k]; k++) {
-                    size_t len = wcslen(kPuncts[k]);
-                    if (s_.compare(i_, len, kPuncts[k]) == 0) {
+                // ilk karaktere gore aday noktalama listesi (uzundan kisaya; tablo bir kez kurulur)
+                struct PunctIndex {
+                    std::vector<int> by[128];
+                    size_t len[128] = {0};
+                    PunctIndex() { for (int k = 0; kPuncts[k]; k++) { len[k] = wcslen(kPuncts[k]); by[kPuncts[k][0] & 127].push_back(k); } }
+                };
+                static const PunctIndex kPI;
+                static const std::vector<int> kNone;
+                const std::vector<int>& cand = c < 128 ? kPI.by[c] : kNone;
+                for (int k : cand) {
+                    size_t len = kPI.len[k];
+                    if (i_ + len <= n && wmemcmp(s_.data() + i_, kPuncts[k], len) == 0) {
                         // "?." ardindan rakam geliyorsa kosul operatorudur: a?.5:b
                         if (len == 2 && kPuncts[k][0] == L'?' && kPuncts[k][1] == L'.' && i_ + 2 < n && iswdigit(s_[i_ + 2])) continue;
-                        t.v = kPuncts[k];
+                        t.v.assign(kPuncts[k], len);
                         i_ += len;
                         found = true;
                         break;
                     }
                 }
                 if (!found) Err(std::wstring(L"beklenmeyen karakter '") + c + L"'");
+                if (StrEq(t.v, L"(")) {
+                    bool ctl = false;
+                    if (!out.empty() && out.back().t == T_Ident && !out.back().escaped) {
+                        const std::wstring& w = out.back().v;
+                        ctl = StrEq(w, L"if") || StrEq(w, L"for") || StrEq(w, L"while") || StrEq(w, L"with");
+                    }
+                    parenCtl_.push_back(ctl);
+                } else if (StrEq(t.v, L")")) {
+                    if (!parenCtl_.empty()) { t.ctrl = parenCtl_.back(); parenCtl_.pop_back(); }
+                }
             }
             out.push_back(std::move(t));
         }
@@ -145,6 +210,8 @@ private:
     size_t i_ = 0;
     int line_;
     bool atLineStart_ = true;
+    std::vector<bool> parenCtl_;
+    bool lastBig_ = false;
 
     [[noreturn]] void Err(const std::wstring& m) { throw SyntaxErr{m, line_}; }
 
@@ -186,7 +253,7 @@ private:
                 i_++;
             }
             if (!any) Err(L"gecersiz sayi");
-            if (i_ < n && s_[i_] == L'n') i_++;
+            if (i_ < n && s_[i_] == L'n') { i_++; lastBig_ = true; }
             return v;
         }
         std::string buf;
@@ -213,7 +280,7 @@ private:
                 buf += e;
             } else i_ = save;
         }
-        if (i_ < n && s_[i_] == L'n') i_++; // BigInt -> sayi olarak
+        if (i_ < n && s_[i_] == L'n') { i_++; lastBig_ = true; }   // BigInt sabiti
         if (i_ < n && IsIdStart(s_[i_])) Err(L"sayidan hemen sonra tanimlayici");
         (void)st;
         return strtod(buf.c_str(), nullptr);
@@ -265,6 +332,14 @@ private:
         const size_t n = s_.size();
         std::wstring o;
         i_++;
+        // hizli yol: kacis/satir sonu yoksa alt dizi
+        {
+            size_t k = i_;
+            while (k < n) { wchar_t c = s_[k]; if (c == q || c == L'\\' || c == L'\n' || c == L'\r') break; k++; }
+            if (k < n && s_[k] == q) { o.assign(s_, i_, k - i_); i_ = k + 1; return o; }
+            o.assign(s_, i_, k - i_);
+            i_ = k;
+        }
         while (true) {
             if (i_ >= n) Err(L"kapanmamis dize");
             wchar_t c = s_[i_];
@@ -284,7 +359,7 @@ private:
         while (true) {
             if (i_ >= n) Err(L"kapanmamis sablon dize");
             wchar_t c = s_[i_];
-            if (c == L'`') { i_++; t.cooked.push_back(cooked); t.raws.push_back(raw); break; }
+            if (c == L'`') { i_++; t.X().cooked.push_back(cooked); t.X().raws.push_back(raw); break; }
             if (c == L'\\') {
                 size_t st = i_;
                 i_++;
@@ -293,16 +368,16 @@ private:
                 continue;
             }
             if (c == L'$' && i_ + 1 < n && s_[i_ + 1] == L'{') {
-                t.cooked.push_back(cooked);
-                t.raws.push_back(raw);
+                t.X().cooked.push_back(cooked);
+                t.X().raws.push_back(raw);
                 cooked.clear();
                 raw.clear();
                 i_ += 2;
                 size_t st = i_;
                 int startLine = line_;
                 SkipBalanced();
-                t.exprs.push_back(s_.substr(st, i_ - st));
-                t.exprLines.push_back(startLine);
+                t.X().exprs.push_back(s_.substr(st, i_ - st));
+                t.X().exprLines.push_back(startLine);
                 i_++; // '}'
                 continue;
             }
@@ -315,18 +390,42 @@ private:
     }
 
     // ${ ... } icinde dengeli kapanisa kadar ilerle (ic ice dizeler/sablonlar dahil)
+    // Duzenli ifade mi bolme mi: ana lekserle ayni kural (onceki anlamli belirtece gore)
+    static bool RegexAfter(wchar_t last, const std::wstring& lastWord) {
+        if (last == 0) return true;
+        if (last == L'a') {
+            static const wchar_t* kw[] = {L"return", L"typeof", L"instanceof", L"in", L"of", L"new", L"delete", L"void",
+                                          L"throw", L"case", L"do", L"else", L"yield", L"await", nullptr};
+            for (int k = 0; kw[k]; k++) if (lastWord == kw[k]) return true;
+            return false;
+        }
+        if (last == L'"' || last == L')' || last == L']') return false;
+        return true;
+    }
+
     void SkipBalanced() {
         const size_t n = s_.size();
         int depth = 0;
+        wchar_t last = 0;            // onceki anlamli belirtec: 'a' ad/sayi, '"' dize/sablon/regex, yoksa noktalama
+        std::wstring lastWord;
         while (i_ < n) {
             wchar_t c = s_[i_];
-            if (c == L'{') depth++;
-            else if (c == L'}') { if (depth == 0) return; depth--; }
-            else if (c == L'"' || c == L'\'') { ReadString(c); continue; }
-            else if (c == L'`') { Tok tmp; ReadTemplate(tmp); continue; }
+            if (c == L'{') { depth++; last = c; }
+            else if (c == L'}') { if (depth == 0) return; depth--; last = c; }
+            else if (c == L'"' || c == L'\'') { ReadString(c); last = L'"'; continue; }
+            else if (c == L'`') { Tok tmp; ReadTemplate(tmp); last = L'"'; continue; }
             else if (c == L'/' && i_ + 1 < n && s_[i_ + 1] == L'/') { while (i_ < n && !IsLineTerm(s_[i_])) i_++; continue; }
-            else if (c == L'/' && i_ + 1 < n && s_[i_ + 1] == L'*') { size_t e = s_.find(L"*/", i_ + 2); if (e == std::wstring::npos) Err(L"kapanmamis yorum"); i_ = e + 2; continue; }
+            else if (c == L'/' && i_ + 1 < n && s_[i_ + 1] == L'*') { size_t e = s_.find(L"*/", i_ + 2); if (e == std::wstring::npos) Err(L"kapanmamis yorum"); for (size_t k = i_; k < e; k++) if (s_[k] == L'\n') line_++; i_ = e + 2; continue; }
+            else if (c == L'/' && RegexAfter(last, lastWord)) { Tok tmp; ReadRegex(tmp); last = L'"'; continue; }
+            else if (IsIdPart(c) || c == L'$' || c == L'\\') {
+                size_t st = i_;
+                while (i_ < n && (IsIdPart(s_[i_]) || s_[i_] == L'$' || s_[i_] == L'\\')) i_++;
+                lastWord.assign(s_, st, i_ - st);
+                last = L'a';
+                continue;
+            }
             else if (c == L'\n') line_++;
+            else if (c != L' ' && c != L'\t' && c != L'\f' && c != L'\v' && c != 0xA0 && c != 0xFEFF && !IsLineTerm(c)) last = c;
             i_++;
         }
         Err(L"kapanmamis ${");
@@ -342,9 +441,10 @@ private:
             for (int k = 0; kw[k]; k++) if (p.v == kw[k]) return true;
             return false;
         }
-        if (p.v == L")" || p.v == L"]") return false;
-        if (p.v == L"}") return true;
-        if (p.v == L"++" || p.v == L"--") return false;
+        if (StrEq(p.v, L")")) return p.ctrl;   // if (x) /re/.test(y)
+        if (StrEq(p.v, L"]")) return false;
+        if (StrEq(p.v, L"}")) return true;
+        if (StrEq(p.v, L"++") || StrEq(p.v, L"--")) return false;
         return true;
     }
 
@@ -363,27 +463,38 @@ private:
             body += c;
             i_++;
         }
-        while (i_ < n && IsIdPart(s_[i_])) t.flags += s_[i_++];
+        while (i_ < n && IsIdPart(s_[i_])) t.X().flags += s_[i_++];
         t.v = body;
     }
 };
 
 bool IsReserved(const std::wstring& s) {
+    // hizli eleme: ayrilmis sozcukler 2..10 harf ve su harflerle baslar: b c d e f i n r s t v w
+    if (s.size() < 2 || s.size() > 10) return false;
+    wchar_t c0 = s[0];
+    if (c0 < L'b' || c0 > L'w') return false;
+    static const uint32_t kFirst = (1u << ('b' - 'a')) | (1u << ('c' - 'a')) | (1u << ('d' - 'a')) | (1u << ('e' - 'a')) | (1u << ('f' - 'a')) |
+                                   (1u << ('i' - 'a')) | (1u << ('n' - 'a')) | (1u << ('r' - 'a')) | (1u << ('s' - 'a')) | (1u << ('t' - 'a')) |
+                                   (1u << ('v' - 'a')) | (1u << ('w' - 'a'));
+    if (!(kFirst & (1u << (c0 - L'a')))) return false;
     static const wchar_t* kw[] = {L"break", L"case", L"catch", L"class", L"const", L"continue", L"debugger", L"default",
                                   L"delete", L"do", L"else", L"export", L"extends", L"finally", L"for", L"function",
                                   L"if", L"import", L"in", L"instanceof", L"new", L"return", L"super", L"switch",
                                   L"this", L"throw", L"try", L"typeof", L"var", L"void", L"while", L"with",
                                   L"null", L"true", L"false", L"enum", nullptr};
-    for (int k = 0; kw[k]; k++) if (s == kw[k]) return true;
+    for (int k = 0; kw[k]; k++) if (StrEq(s, kw[k])) return true;
     return false;
 }
 
 Str MkStr(const std::wstring& s) { return std::make_shared<const std::wstring>(s); }
 
+bool g_lazyParsing = true;
+
 class Parser {
 public:
-    Parser(std::vector<Tok> toks, Script& sc, std::vector<FuncInfo*>& fstack)
-        : t_(std::move(toks)), sc_(sc), fs_(fstack) {}
+    Parser(std::vector<Tok> toks, Script& sc, std::vector<FuncInfo*>& fstack, std::shared_ptr<const std::wstring> src = nullptr)
+        : t_(std::move(toks)), sc_(sc), fs_(fstack), src_(std::move(src)) {}
+    friend void ::mer::js::EnsureParsed(FuncInfo* fi);
 
     Ast* ParseProgramBody() {
         Ast* p = sc_.New(K::Program, 1);
@@ -403,6 +514,8 @@ private:
     size_t i_ = 0;
     Script& sc_;
     std::vector<FuncInfo*>& fs_;
+    std::shared_ptr<const std::wstring> src_;   // bos: tembel ayristirma yok
+    bool eagerNext_ = false;                    // siradaki govde hemen ayristirilsin (IIFE)
     int nest_ = 0;
     std::vector<bool> asyncCtx_{false};
     std::vector<bool> genCtx_{false};
@@ -413,12 +526,13 @@ private:
         ~NestGuard() { n--; }
     };
 
+    Str MkStr(const std::wstring& s) { return sc_.Intern(s); }   // ortak (interned) dize
     [[noreturn]] void Err(const std::wstring& m) { throw SyntaxErr{m, Cur().line}; }
     const Tok& Cur() const { return t_[std::min(i_, t_.size() - 1)]; }
     const Tok& PeekT(size_t k) const { return t_[std::min(i_ + k, t_.size() - 1)]; }
     bool AtEOF() const { return Cur().t == T_EOF; }
-    bool IsP(const wchar_t* p, size_t k = 0) const { const Tok& t = PeekT(k); return t.t == T_Punct && t.v == p; }
-    bool IsId(const wchar_t* w, size_t k = 0) const { const Tok& t = PeekT(k); return t.t == T_Ident && !t.escaped && t.v == w; }
+    bool IsP(const wchar_t* p, size_t k = 0) const { const Tok& t = PeekT(k); return t.t == T_Punct && StrEq(t.v, p); }
+    bool IsId(const wchar_t* w, size_t k = 0) const { const Tok& t = PeekT(k); return t.t == T_Ident && !t.escaped && StrEq(t.v, w); }
     bool Eat(const wchar_t* p) { if (IsP(p)) { i_++; return true; } return false; }
     void Expect(const wchar_t* p) { if (!Eat(p)) Err(std::wstring(L"'") + p + L"' bekleniyordu, '" + Cur().v + L"' bulundu"); }
     bool EatId(const wchar_t* w) { if (IsId(w)) { i_++; return true; } return false; }
@@ -480,15 +594,15 @@ private:
         if (IsP(L";")) { i_++; return sc_.New(K::Empty, ln); }
         if (Cur().t == T_Ident && !Cur().escaped) {
             const std::wstring& w = Cur().v;
-            if (w == L"var" || w == L"const" || (w == L"let" && (PeekT(1).t == T_Ident || IsP(L"[", 1) || IsP(L"{", 1)))) {
+            if (StrEq(w, L"var") || StrEq(w, L"const") || (StrEq(w, L"let") && (PeekT(1).t == T_Ident || IsP(L"[", 1) || IsP(L"{", 1)))) {
                 Ast* d = VarDecl(false);
                 Semi();
                 return d;
             }
-            if (w == L"function") return FunctionNode(true, false);
-            if (w == L"async" && IsId(L"function", 1) && !PeekT(1).nl) { i_++; return FunctionNode(true, true); }
-            if (w == L"class") return ClassNode(true);
-            if (w == L"if") {
+            if (StrEq(w, L"function")) return FunctionNode(true, false);
+            if (StrEq(w, L"async") && IsId(L"function", 1) && !PeekT(1).nl) { i_++; return FunctionNode(true, true); }
+            if (StrEq(w, L"class")) return ClassNode(true);
+            if (StrEq(w, L"if")) {
                 i_++;
                 Expect(L"(");
                 Ast* s = sc_.New(K::If, ln);
@@ -498,8 +612,8 @@ private:
                 if (IsId(L"else")) { i_++; s->c = Statement(); }
                 return s;
             }
-            if (w == L"for") return ForStatement();
-            if (w == L"while") {
+            if (StrEq(w, L"for")) return ForStatement();
+            if (StrEq(w, L"while")) {
                 i_++;
                 Expect(L"(");
                 Ast* s = sc_.New(K::While, ln);
@@ -508,7 +622,7 @@ private:
                 s->b = Statement();
                 return s;
             }
-            if (w == L"do") {
+            if (StrEq(w, L"do")) {
                 i_++;
                 Ast* s = sc_.New(K::DoWhile, ln);
                 s->b = Statement();
@@ -520,21 +634,21 @@ private:
                 Eat(L";");
                 return s;
             }
-            if (w == L"return") {
+            if (StrEq(w, L"return")) {
                 i_++;
                 Ast* s = sc_.New(K::Return, ln);
                 if (!IsP(L";") && !IsP(L"}") && !AtEOF() && !Cur().nl) s->a = Expression(false);
                 Semi();
                 return s;
             }
-            if (w == L"break" || w == L"continue") {
+            if (StrEq(w, L"break") || StrEq(w, L"continue")) {
                 i_++;
-                Ast* s = sc_.New(w == L"break" ? K::Break : K::Continue, ln);
+                Ast* s = sc_.New(StrEq(w, L"break") ? K::Break : K::Continue, ln);
                 if (Cur().t == T_Ident && !Cur().nl && !IsReserved(Cur().v)) s->str2 = t_[i_++].v;
                 Semi();
                 return s;
             }
-            if (w == L"throw") {
+            if (StrEq(w, L"throw")) {
                 i_++;
                 if (Cur().nl) Err(L"throw sonrasi satir sonu");
                 Ast* s = sc_.New(K::Throw, ln);
@@ -542,12 +656,12 @@ private:
                 Semi();
                 return s;
             }
-            if (w == L"try") return TryStatement();
-            if (w == L"switch") return SwitchStatement();
-            if (w == L"debugger") { i_++; Semi(); return sc_.New(K::Empty, ln); }
-            if (w == L"import" && !IsP(L"(", 1) && !IsP(L".", 1)) return ImportDeclaration();
-            if (w == L"export") return ExportDeclaration();
-            if (w == L"with") {
+            if (StrEq(w, L"try")) return TryStatement();
+            if (StrEq(w, L"switch")) return SwitchStatement();
+            if (StrEq(w, L"debugger")) { i_++; Semi(); return sc_.New(K::Empty, ln); }
+            if (StrEq(w, L"import") && !IsP(L"(", 1) && !IsP(L".", 1)) return ImportDeclaration();
+            if (StrEq(w, L"export")) return ExportDeclaration();
+            if (StrEq(w, L"with")) {
                 i_++;
                 Expect(L"(");
                 Ast* s = sc_.New(K::With, ln);
@@ -556,7 +670,7 @@ private:
                 s->b = Statement();
                 return s;
             }
-            if (PeekT(1).t == T_Punct && PeekT(1).v == L":" && !IsReserved(w)) {
+            if (PeekT(1).t == T_Punct && StrEq(PeekT(1).v, L":") && !IsReserved(w)) {
                 i_ += 2;
                 Ast* s = sc_.New(K::Labeled, ln);
                 s->str2 = w;
@@ -585,7 +699,7 @@ private:
     Ast* VarDecl(bool noIn) {
         Ast* d = sc_.New(K::VarDecl, Line());
         const std::wstring& w = Cur().v;
-        d->kind = w == L"var" ? 0 : w == L"let" ? 1 : 2;
+        d->kind = StrEq(w, L"var") ? 0 : StrEq(w, L"let") ? 1 : 2;
         i_++;
         do {
             Ast* dc = sc_.New(K::Declarator, Line());
@@ -610,15 +724,22 @@ private:
     Ast* ForStatement() {
         int ln = Line();
         i_++;
-        if (IsId(L"await")) Err(L"'for await' desteklenmiyor");
+        bool isAwait = false;
+        if (IsId(L"await")) {
+            if (!asyncCtx_.back()) Err(L"'for await' yalnizca async fonksiyonlarda kullanilabilir");
+            i_++;
+            isAwait = true;
+        }
         Expect(L"(");
         Ast* init = nullptr;
-        if (Cur().t == T_Ident && (Cur().v == L"var" || Cur().v == L"const" || (Cur().v == L"let" && (PeekT(1).t == T_Ident || IsP(L"[", 1) || IsP(L"{", 1))))) {
+        if (Cur().t == T_Ident && (StrEq(Cur().v, L"var") || StrEq(Cur().v, L"const") || (StrEq(Cur().v, L"let") && (PeekT(1).t == T_Ident || IsP(L"[", 1) || IsP(L"{", 1))))) {
             init = VarDecl(true);
             if (init->list.size() == 1 && !init->list[0]->b && (IsId(L"of") || IsId(L"in"))) {
                 bool of = IsId(L"of");
                 i_++;
+                if (isAwait && !of) Err(L"'for await' yalnizca 'of' ile kullanilabilir");
                 Ast* s = sc_.New(of ? K::ForOf : K::ForIn, ln);
+                s->flag = isAwait;
                 s->a = init;
                 s->b = of ? Assignment(false) : Expression(false);
                 Expect(L")");
@@ -630,7 +751,9 @@ private:
             if (IsId(L"of") || IsId(L"in")) {
                 bool of = IsId(L"of");
                 i_++;
+                if (isAwait && !of) Err(L"'for await' yalnizca 'of' ile kullanilabilir");
                 Ast* s = sc_.New(of ? K::ForOf : K::ForIn, ln);
+                s->flag = isAwait;
                 s->a = ToPattern(e);
                 s->b = of ? Assignment(false) : Expression(false);
                 Expect(L")");
@@ -640,6 +763,7 @@ private:
             init = sc_.New(K::ExprStmt, ln);
             init->a = e;
         }
+        if (isAwait) Err(L"'for await' yalnizca 'of' ile kullanilabilir");
         Expect(L";");
         Ast* s = sc_.New(K::For, ln);
         s->a = init;
@@ -707,7 +831,7 @@ private:
         }
 
         // 2) import defaultExport ...
-        if (Cur().t == T_Ident && Cur().v != L"*" && Cur().v != L"{") {
+        if (Cur().t == T_Ident && !StrEq(Cur().v, L"*") && !StrEq(Cur().v, L"{")) {
             Ast* defSpec = sc_.New(K::ImportSpec, ln);
             defSpec->str = MkStr(L"default");
             defSpec->str2 = BindingIdent();
@@ -878,7 +1002,36 @@ private:
         Expect(L")");
     }
 
+    // '{' konumundan eslesen '}' belirtecine (sablon/regex belirtecleri tek parca oldugundan basit sayim)
+    size_t MatchBrace(size_t i) const {
+        int depth = 0;
+        for (size_t k = i; k < t_.size(); k++) {
+            const Tok& t = t_[k];
+            if (t.t == T_EOF) return size_t(-1);
+            if (t.t != T_Punct || t.v.size() != 1) continue;
+            if (t.v[0] == L'{') depth++;
+            else if (t.v[0] == L'}') { if (--depth == 0) return k; }
+        }
+        return size_t(-1);
+    }
+
     void FunctionBody(FuncInfo* f) {
+        bool eager = eagerNext_;
+        eagerNext_ = false;
+        if (g_lazyParsing && src_ && !eager && IsP(L"{")) {
+            size_t j = MatchBrace(i_);
+            if (j != size_t(-1)) {
+                std::unique_ptr<LazyBody> lz(new LazyBody());
+                lz->src = src_;
+                lz->begin = t_[i_].pos;
+                lz->end = t_[j].pos + 1;
+                lz->line = t_[i_].line;
+                f->lazy = std::move(lz);
+                f->script = &sc_;
+                i_ = j + 1;
+                return;
+            }
+        }
         fs_.push_back(f);
         asyncCtx_.push_back(f->isAsync);
         genCtx_.push_back(f->isGen);
@@ -891,6 +1044,8 @@ private:
     // 'function' anahtar sozcugunde
     Ast* FunctionNode(bool decl, bool isAsync) {
         int ln = Line();
+        // "(function(){...})()" / "!function(){...}()": hemen cagrilacak - tembel ayristirma faydasiz
+        bool iife = i_ > 0 && t_[i_ - 1].t == T_Punct && (StrEq(t_[i_ - 1].v, L"(") || StrEq(t_[i_ - 1].v, L"!"));
         i_++; // function
         FuncInfo* f = NewFunc();
         f->isAsync = isAsync;
@@ -905,6 +1060,7 @@ private:
         fs_.push_back(f); // parametrelerdeki 'arguments'/varsayilanlar icin
         Params(f);
         fs_.pop_back();
+        eagerNext_ = iife;
         FunctionBody(f);
         if (decl && !fs_.empty()) fs_.back()->varNames.push_back(f->name);
         return fn;
@@ -1028,7 +1184,7 @@ private:
             if (IsId(L"async") && !IsP(L"(", 1) && !IsP(L"=", 1) && !PeekT(1).nl) { i_++; isAsync = true; }
             if (Eat(L"*")) isGen = true;
             if ((IsId(L"get") || IsId(L"set")) && !IsP(L"(", 1) && !IsP(L"=", 1) && !IsP(L";", 1) && !IsP(L"}", 1)) {
-                kind = Cur().v == L"get" ? 1 : 2;
+                kind = StrEq(Cur().v, L"get") ? 1 : 2;
                 i_++;
             }
             bool computed;
@@ -1036,7 +1192,7 @@ private:
             m->flag = computed;
             std::wstring nm = (!computed && m->a->str) ? *m->a->str : L"";
             if (IsP(L"(")) {
-                bool isCtor = !m->isStatic && !computed && nm == L"constructor" && kind == 0;
+                bool isCtor = !m->isStatic && !computed && StrEq(nm, L"constructor") && kind == 0;
                 m->kind = uint8_t(kind);
                 m->b = MethodFunction(isCtor ? 4 : (kind == 1 ? 2 : kind == 2 ? 3 : 1), isAsync, isGen, nm);
                 if (isCtor) { c->b = m->b; continue; }
@@ -1080,8 +1236,8 @@ private:
         for (size_t k = open; k < t_.size(); k++) {
             const Tok& t = t_[k];
             if (t.t != T_Punct) continue;
-            if (t.v == L"(" || t.v == L"[" || t.v == L"{") depth++;
-            else if (t.v == L")" || t.v == L"]" || t.v == L"}") { if (--depth == 0) return k; }
+            if (StrEq(t.v, L"(") || StrEq(t.v, L"[") || StrEq(t.v, L"{")) depth++;
+            else if (StrEq(t.v, L")") || StrEq(t.v, L"]") || StrEq(t.v, L"}")) { if (--depth == 0) return k; }
             if (t.t == T_EOF) break;
         }
         return std::string::npos;
@@ -1092,16 +1248,16 @@ private:
         size_t m = MatchParen(i_);
         if (m == std::string::npos || m + 1 >= t_.size()) return false;
         const Tok& t = t_[m + 1];
-        return t.t == T_Punct && t.v == L"=>" && !t.nl;
+        return t.t == T_Punct && StrEq(t.v, L"=>") && !t.nl;
     }
 
     static uint8_t AssignOp(const std::wstring& v) {
-        if (v == L"=") return O_None;
-        if (v == L"+=") return O_Add; if (v == L"-=") return O_Sub; if (v == L"*=") return O_Mul;
-        if (v == L"/=") return O_Div; if (v == L"%=") return O_Mod; if (v == L"**=") return O_Exp;
-        if (v == L"<<=") return O_Shl; if (v == L">>=") return O_Shr; if (v == L">>>=") return O_UShr;
-        if (v == L"&=") return O_BitAnd; if (v == L"|=") return O_BitOr; if (v == L"^=") return O_BitXor;
-        if (v == L"&&=") return O_And; if (v == L"||=") return O_Or; if (v == L"?\?=") return O_Nullish;
+        if (StrEq(v, L"=")) return O_None;
+        if (StrEq(v, L"+=")) return O_Add; if (StrEq(v, L"-=")) return O_Sub; if (StrEq(v, L"*=")) return O_Mul;
+        if (StrEq(v, L"/=")) return O_Div; if (StrEq(v, L"%=")) return O_Mod; if (StrEq(v, L"**=")) return O_Exp;
+        if (StrEq(v, L"<<=")) return O_Shl; if (StrEq(v, L">>=")) return O_Shr; if (StrEq(v, L">>>=")) return O_UShr;
+        if (StrEq(v, L"&=")) return O_BitAnd; if (StrEq(v, L"|=")) return O_BitOr; if (StrEq(v, L"^=")) return O_BitXor;
+        if (StrEq(v, L"&&=")) return O_And; if (StrEq(v, L"||=")) return O_Or; if (StrEq(v, L"?\?=")) return O_Nullish;
         return 255;
     }
 
@@ -1110,7 +1266,7 @@ private:
         int ln = Line();
         // ok fonksiyonlari
         if (Cur().t == T_Ident && !Cur().escaped) {
-            if (Cur().v == L"async" && !PeekT(1).nl) {
+            if (StrEq(Cur().v, L"async") && !PeekT(1).nl) {
                 if (PeekT(1).t == T_Ident && IsP(L"=>", 2)) { i_++; return ArrowFrom(i_, true); }
                 if (IsP(L"(", 1)) {
                     size_t save = i_;
@@ -1120,7 +1276,7 @@ private:
                 }
             }
             if (IsP(L"=>", 1) && !IsReserved(Cur().v)) return ArrowFrom(i_, false);
-            if (Cur().v == L"yield" && genCtx_.back()) {
+            if (StrEq(Cur().v, L"yield") && genCtx_.back()) {
                 i_++;
                 Ast* y = sc_.New(K::Yield, ln);
                 if (Eat(L"*")) y->flag = true;
@@ -1167,35 +1323,35 @@ private:
     int BinPrec(const Tok& t, bool noIn, uint8_t& op, bool& logic) const {
         logic = false;
         if (t.t == T_Ident && !t.escaped) {
-            if (t.v == L"instanceof") { op = O_InstanceOf; return 8; }
-            if (t.v == L"in" && !noIn) { op = O_In; return 8; }
+            if (StrEq(t.v, L"instanceof")) { op = O_InstanceOf; return 8; }
+            if (StrEq(t.v, L"in") && !noIn) { op = O_In; return 8; }
             return -1;
         }
         if (t.t != T_Punct) return -1;
         const std::wstring& v = t.v;
-        if (v == L"??") { op = O_Nullish; logic = true; return 1; }
-        if (v == L"||") { op = O_Or; logic = true; return 2; }
-        if (v == L"&&") { op = O_And; logic = true; return 3; }
-        if (v == L"|") { op = O_BitOr; return 4; }
-        if (v == L"^") { op = O_BitXor; return 5; }
-        if (v == L"&") { op = O_BitAnd; return 6; }
-        if (v == L"==") { op = O_Eq; return 7; }
-        if (v == L"!=") { op = O_Ne; return 7; }
-        if (v == L"===") { op = O_SEq; return 7; }
-        if (v == L"!==") { op = O_SNe; return 7; }
-        if (v == L"<") { op = O_Lt; return 8; }
-        if (v == L">") { op = O_Gt; return 8; }
-        if (v == L"<=") { op = O_Le; return 8; }
-        if (v == L">=") { op = O_Ge; return 8; }
-        if (v == L"<<") { op = O_Shl; return 9; }
-        if (v == L">>") { op = O_Shr; return 9; }
-        if (v == L">>>") { op = O_UShr; return 9; }
-        if (v == L"+") { op = O_Add; return 10; }
-        if (v == L"-") { op = O_Sub; return 10; }
-        if (v == L"*") { op = O_Mul; return 11; }
-        if (v == L"/") { op = O_Div; return 11; }
-        if (v == L"%") { op = O_Mod; return 11; }
-        if (v == L"**") { op = O_Exp; return 12; }
+        if (StrEq(v, L"??")) { op = O_Nullish; logic = true; return 1; }
+        if (StrEq(v, L"||")) { op = O_Or; logic = true; return 2; }
+        if (StrEq(v, L"&&")) { op = O_And; logic = true; return 3; }
+        if (StrEq(v, L"|")) { op = O_BitOr; return 4; }
+        if (StrEq(v, L"^")) { op = O_BitXor; return 5; }
+        if (StrEq(v, L"&")) { op = O_BitAnd; return 6; }
+        if (StrEq(v, L"==")) { op = O_Eq; return 7; }
+        if (StrEq(v, L"!=")) { op = O_Ne; return 7; }
+        if (StrEq(v, L"===")) { op = O_SEq; return 7; }
+        if (StrEq(v, L"!==")) { op = O_SNe; return 7; }
+        if (StrEq(v, L"<")) { op = O_Lt; return 8; }
+        if (StrEq(v, L">")) { op = O_Gt; return 8; }
+        if (StrEq(v, L"<=")) { op = O_Le; return 8; }
+        if (StrEq(v, L">=")) { op = O_Ge; return 8; }
+        if (StrEq(v, L"<<")) { op = O_Shl; return 9; }
+        if (StrEq(v, L">>")) { op = O_Shr; return 9; }
+        if (StrEq(v, L">>>")) { op = O_UShr; return 9; }
+        if (StrEq(v, L"+")) { op = O_Add; return 10; }
+        if (StrEq(v, L"-")) { op = O_Sub; return 10; }
+        if (StrEq(v, L"*")) { op = O_Mul; return 11; }
+        if (StrEq(v, L"/")) { op = O_Div; return 11; }
+        if (StrEq(v, L"%")) { op = O_Mod; return 11; }
+        if (StrEq(v, L"**")) { op = O_Exp; return 12; }
         return -1;
     }
 
@@ -1226,10 +1382,10 @@ private:
         const Tok& t = Cur();
         if (t.t == T_Punct) {
             uint8_t op = 0;
-            if (t.v == L"!") op = O_Not;
-            else if (t.v == L"-") op = O_Neg;
-            else if (t.v == L"+") op = O_Pos;
-            else if (t.v == L"~") op = O_BitNot;
+            if (StrEq(t.v, L"!")) op = O_Not;
+            else if (StrEq(t.v, L"-")) op = O_Neg;
+            else if (StrEq(t.v, L"+")) op = O_Pos;
+            else if (StrEq(t.v, L"~")) op = O_BitNot;
             if (op) {
                 i_++;
                 Ast* u = sc_.New(K::Unary, ln);
@@ -1237,10 +1393,10 @@ private:
                 u->a = Unary();
                 return u;
             }
-            if (t.v == L"++" || t.v == L"--") {
+            if (StrEq(t.v, L"++") || StrEq(t.v, L"--")) {
                 i_++;
                 Ast* u = sc_.New(K::Update, ln);
-                u->op = t_[i_ - 1].v == L"++" ? O_Inc : O_Dec;
+                u->op = StrEq(t_[i_ - 1].v, L"++") ? O_Inc : O_Dec;
                 u->flag = true;
                 u->a = Unary();
                 if (u->a->k != K::Ident && u->a->k != K::Member && u->a->k != K::Index) Err(L"gecersiz ++/-- hedefi");
@@ -1249,9 +1405,9 @@ private:
         }
         if (t.t == T_Ident && !t.escaped) {
             uint8_t op = 0;
-            if (t.v == L"typeof") op = O_TypeOf;
-            else if (t.v == L"void") op = O_Void;
-            else if (t.v == L"delete") op = O_Delete;
+            if (StrEq(t.v, L"typeof")) op = O_TypeOf;
+            else if (StrEq(t.v, L"void")) op = O_Void;
+            else if (StrEq(t.v, L"delete")) op = O_Delete;
             if (op) {
                 i_++;
                 Ast* u = sc_.New(K::Unary, ln);
@@ -1259,7 +1415,7 @@ private:
                 u->a = Unary();
                 return u;
             }
-            if (t.v == L"await" && asyncCtx_.back()) {
+            if (StrEq(t.v, L"await") && asyncCtx_.back()) {
                 i_++;
                 Ast* u = sc_.New(K::Await, ln);
                 u->a = Unary();
@@ -1267,10 +1423,10 @@ private:
             }
         }
         Ast* e = LeftHandSide();
-        if (Cur().t == T_Punct && !Cur().nl && (Cur().v == L"++" || Cur().v == L"--")) {
+        if (Cur().t == T_Punct && !Cur().nl && (StrEq(Cur().v, L"++") || StrEq(Cur().v, L"--"))) {
             if (e->k != K::Ident && e->k != K::Member && e->k != K::Index) Err(L"gecersiz ++/-- hedefi");
             Ast* u = sc_.New(K::Update, ln);
-            u->op = Cur().v == L"++" ? O_Inc : O_Dec;
+            u->op = StrEq(Cur().v, L"++") ? O_Inc : O_Dec;
             u->a = e;
             i_++;
             return u;
@@ -1293,11 +1449,13 @@ private:
 
     Ast* TemplateNode(const Tok& t, int ln) {
         Ast* n = sc_.New(K::Tpl, ln);
-        for (auto& s : t.cooked) n->cooked.push_back(MkStr(s));
-        for (auto& s : t.raws) n->raw.push_back(MkStr(s));
-        for (size_t k = 0; k < t.exprs.size(); k++) {
-            Lexer lx(t.exprs[k], t.exprLines[k]);
-            Parser sub(lx.Run(), sc_, fs_);
+        static const TokExtra kNoExtra;
+        const TokExtra& tx = t.ex ? *t.ex : kNoExtra;
+        for (auto& s : tx.cooked) n->cooked.push_back(MkStr(s));
+        for (auto& s : tx.raws) n->raw.push_back(MkStr(s));
+        for (size_t k = 0; k < tx.exprs.size(); k++) {
+            Lexer lx(tx.exprs[k], tx.exprLines[k]);
+            Parser sub(lx.Run(), sc_, fs_, src_ ? std::make_shared<const std::wstring>(tx.exprs[k]) : nullptr);
             sub.asyncCtx_ = asyncCtx_;
             sub.genCtx_ = genCtx_;
             sub.nest_ = nest_;
@@ -1416,34 +1574,40 @@ private:
         int ln = Line();
         const Tok& t = Cur();
         switch (t.t) {
-        case T_Num: { Ast* n = sc_.New(K::Num, ln); n->num = t.num; i_++; return n; }
+        case T_Num: {
+            Ast* n = sc_.New(K::Num, ln);
+            n->num = t.num;
+            if (t.big) { n->flag2 = true; n->str = MkStr(t.v); }   // 123n
+            i_++;
+            return n;
+        }
         case T_Str: { Ast* n = sc_.New(K::Str, ln); n->str = MkStr(t.v); i_++; return n; }
         case T_Tpl: { Ast* n = TemplateNode(t, ln); i_++; return n; }
-        case T_Regex: { Ast* n = sc_.New(K::Regex, ln); n->str = MkStr(t.v); n->str2 = t.flags; i_++; return n; }
+        case T_Regex: { Ast* n = sc_.New(K::Regex, ln); n->str = MkStr(t.v); n->str2 = t.ex ? t.ex->flags : std::wstring(); i_++; return n; }
         case T_EOF: Err(L"beklenmeyen dosya sonu");
         case T_Punct: {
-            if (t.v == L"(") {
+            if (StrEq(t.v, L"(")) {
                 i_++;
                 Ast* e = Expression(false);
                 Expect(L")");
                 return e;
             }
-            if (t.v == L"[") return ArrayLiteral();
-            if (t.v == L"{") return ObjectLiteral();
+            if (StrEq(t.v, L"[")) return ArrayLiteral();
+            if (StrEq(t.v, L"{")) return ObjectLiteral();
             Err(L"beklenmeyen '" + t.v + L"'");
         }
         case T_Ident: {
             if (!t.escaped) {
                 const std::wstring& w = t.v;
-                if (w == L"function") return FunctionNode(false, false);
-                if (w == L"async" && IsId(L"function", 1) && !PeekT(1).nl) { i_++; return FunctionNode(false, true); }
-                if (w == L"class") return ClassNode(false);
-                if (w == L"this") { i_++; return sc_.New(K::This, ln); }
-                if (w == L"null") { i_++; return sc_.New(K::Null, ln); }
-                if (w == L"true") { i_++; return sc_.New(K::True, ln); }
-                if (w == L"false") { i_++; return sc_.New(K::False, ln); }
-                if (w == L"super") { i_++; return sc_.New(K::Super, ln); }
-                if (w == L"import") {
+                if (StrEq(w, L"function")) return FunctionNode(false, false);
+                if (StrEq(w, L"async") && IsId(L"function", 1) && !PeekT(1).nl) { i_++; return FunctionNode(false, true); }
+                if (StrEq(w, L"class")) return ClassNode(false);
+                if (StrEq(w, L"this")) { i_++; return sc_.New(K::This, ln); }
+                if (StrEq(w, L"null")) { i_++; return sc_.New(K::Null, ln); }
+                if (StrEq(w, L"true")) { i_++; return sc_.New(K::True, ln); }
+                if (StrEq(w, L"false")) { i_++; return sc_.New(K::False, ln); }
+                if (StrEq(w, L"super")) { i_++; return sc_.New(K::Super, ln); }
+                if (StrEq(w, L"import")) {
                     if (IsP(L"(", 1)) {
                         i_++;
                         Expect(L"(");
@@ -1462,8 +1626,8 @@ private:
             }
             Ast* id = sc_.New(K::Ident, ln);
             id->str = MkStr(t.v);
-            if (t.v == L"arguments") for (auto* f : fs_) if (!f->arrow) { (void)f; }
-            if (t.v == L"arguments" && !fs_.empty()) {
+            if (StrEq(t.v, L"arguments")) for (auto* f : fs_) if (!f->arrow) { (void)f; }
+            if (StrEq(t.v, L"arguments") && !fs_.empty()) {
                 // en yakin ok-olmayan fonksiyon 'arguments' kullanir
                 for (size_t k = fs_.size(); k-- > 0;) { fs_[k]->usesArgs = true; if (!fs_[k]->arrow) break; }
             }
@@ -1508,7 +1672,7 @@ private:
             if (IsId(L"async") && !IsP(L",", 1) && !IsP(L":", 1) && !IsP(L"(", 1) && !IsP(L"}", 1) && !IsP(L"=", 1) && !PeekT(1).nl) { i_++; isAsync = true; }
             if (Eat(L"*")) isGen = true;
             if ((IsId(L"get") || IsId(L"set")) && !IsP(L",", 1) && !IsP(L":", 1) && !IsP(L"(", 1) && !IsP(L"}", 1) && !IsP(L"=", 1)) {
-                kind = Cur().v == L"get" ? 1 : 2;
+                kind = StrEq(Cur().v, L"get") ? 1 : 2;
                 i_++;
             }
             bool shorthandCandidate = Cur().t == T_Ident;
@@ -1597,6 +1761,28 @@ private:
     }
 };
 
+// Askiya alma noktalarini isaretle: dugumun alt agacinda (ic fonksiyonlar haric)
+// await, yield ya da 'for await' varsa sus = true. Yorumlayici bu dugumleri
+// coroutine makinesinde, digerlerini hizli ozyinelemeli yolda calistirir.
+static bool MarkSuspend(Ast* n, int depth) {
+    if (!n) return false;
+    if (depth > 20000) return true;   // asiri derin agac: guvenli tarafta kal
+    bool s = false;
+    s |= MarkSuspend(n->a, depth + 1);
+    s |= MarkSuspend(n->b, depth + 1);
+    s |= MarkSuspend(n->c, depth + 1);
+    s |= MarkSuspend(n->d, depth + 1);
+    for (Ast* x : n->list) s |= MarkSuspend(x, depth + 1);
+    if (n->k == K::Func && n->fi) {
+        for (Ast* p : n->fi->params) MarkSuspend(p, depth + 1);
+        MarkSuspend(n->fi->body, depth + 1);
+        s = false;   // ic fonksiyonun await/yield'i dis fonksiyonu askiya almaz
+    }
+    if (n->k == K::Await || n->k == K::Yield || (n->k == K::ForOf && n->flag)) s = true;
+    n->sus = s;
+    return s;
+}
+
 } // namespace
 
 void ParseProgram(const std::wstring& src, Script& out) {
@@ -1605,9 +1791,34 @@ void ParseProgram(const std::wstring& src, Script& out) {
     out.funcs.emplace_back(new FuncInfo());
     FuncInfo* top = out.funcs.back().get();
     std::vector<FuncInfo*> fs{top};
-    Parser p(std::move(toks), out, fs);
+    if (g_lazyParsing) out.source = std::make_shared<const std::wstring>(src);
+    Parser p(std::move(toks), out, fs, out.source);
     out.root = p.ParseProgramBody();
     out.root->fi = top;
+    for (auto& f : out.funcs) f->file = &out.name;
+    MarkSuspend(out.root, 0);
+}
+
+void SetLazyParsing(bool on) { g_lazyParsing = on; }
+
+void EnsureParsed(FuncInfo* fi) {
+    if (!fi || !fi->lazy) return;
+    LazyBody& lz = *fi->lazy;
+    Script& sc = *fi->script;
+    auto sub = std::make_shared<const std::wstring>(lz.src->substr(lz.begin, lz.end - lz.begin));
+    Lexer lx(*sub, lz.line);
+    std::vector<Tok> toks = lx.Run();
+    size_t firstNew = sc.funcs.size();
+    std::vector<FuncInfo*> fs{fi};
+    Parser p(std::move(toks), sc, fs, sub);
+    p.asyncCtx_ = {fi->isAsync};
+    p.genCtx_ = {fi->isGen};
+    Ast* body = p.Block();
+    if (!p.AtEOF()) p.Err(L"fonksiyon govdesinden sonra fazla belirtec");
+    fi->body = body;
+    fi->lazy.reset();   // basarili: artik tembel degil (hata olursa tembel kalir, tekrar denenir)
+    for (size_t i = firstNew; i < sc.funcs.size(); i++) sc.funcs[i]->file = &sc.name;
+    MarkSuspend(fi->body, 1);
 }
 
 } // namespace js

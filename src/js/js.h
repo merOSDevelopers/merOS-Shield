@@ -2,6 +2,7 @@
 // Agac-gezen (tree-walking) yorumlayici, isaretle-supur (mark & sweep) cop toplayici,
 // adim/bellek/ozyineleme sinirlari ile korumali calisma.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <cmath>
@@ -19,6 +20,8 @@ struct Document;
 class StyleSheet;
 
 namespace js {
+struct FuncInfo;
+struct MediaState;   // js_media.cpp
 
 struct Obj;
 struct Env;
@@ -29,7 +32,7 @@ using Str = std::shared_ptr<const std::wstring>;
 
 // ---------------- Deger ----------------
 struct Value {
-    enum Type : uint8_t { Undef, Null, Bool, Num, String, Symbol, Object };
+    enum Type : uint8_t { Undef, Null, Bool, Num, String, Symbol, Object, BigInt };   // BigInt: s icinde paketli (js_bigint.h)
     Type t = Undef;
     bool b = false;
     double n = 0;
@@ -40,16 +43,23 @@ struct Value {
     static Value Null_() { Value v; v.t = Null; return v; }
     static Value B(bool x) { Value v; v.t = Bool; v.b = x; return v; }
     static Value N(double x) { Value v; v.t = Num; v.n = x; return v; }
-    static Value S(const std::wstring& x) { Value v; v.t = String; v.s = std::make_shared<const std::wstring>(x); return v; }
-    static Value S(std::wstring&& x) { Value v; v.t = String; v.s = std::make_shared<const std::wstring>(std::move(x)); return v; }
+    // Not: nesne const olmayan wstring olarak olusturulur (s += x hizli yolu tek sahipli dizgeyi yerinde buyutur)
+    static Value S(const std::wstring& x) { Value v; v.t = String; v.s = std::make_shared<std::wstring>(x); return v; }
+    static Value S(std::wstring&& x) { Value v; v.t = String; v.s = std::make_shared<std::wstring>(std::move(x)); return v; }
     static Value S(Str x) { Value v; v.t = String; v.s = std::move(x); return v; }
     static Value O(Obj* x) { Value v; if (x) { v.t = Object; v.o = x; } return v; }
+    // Dizi boslugu (hole): Array(3), [1,,2], delete a[i]. undefined gibi davranir; forEach/map/keys atlar.
+    static Value Hole() { Value v; v.b = true; return v; }
+    bool IsHole() const { return t == Undef && b; }
     bool IsUndef() const { return t == Undef; }
     bool IsNullish() const { return t == Undef || t == Null; }
     bool IsObj() const { return t == Object; }
     bool IsStr() const { return t == String; }
     bool IsNum() const { return t == Num; }
+    bool IsBig() const { return t == BigInt; }
 };
+
+inline Value Unhole(const Value& v) { return v.IsHole() ? Value() : v; }
 
 // ---------------- Cop toplanan hucreler ----------------
 struct Cell {
@@ -92,8 +102,14 @@ enum class TypedKind : uint8_t {
     Int8, Uint8, Uint8Clamped,
     Int16, Uint16,
     Int32, Uint32,
-    Float32, Float64
+    Float32, Float64,
+    BigInt64, BigUint64
 };
+
+// BigInt tipli diziler icin (tanimlari js_runtime.cpp'de; js_bigint.h'yi burada gerektirmemek icin)
+Value BigFromI64(int64_t v);
+Value BigFromU64(uint64_t v);
+uint64_t BigToU64Wrap(Runtime& rt, const Value& v);   // BigInt'e cevir, mod 2^64 (BigInt degilse TypeError)
 
 inline size_t ElementSize(TypedKind kind) {
     switch (kind) {
@@ -109,6 +125,8 @@ inline size_t ElementSize(TypedKind kind) {
     case TypedKind::Float32:
         return 4;
     case TypedKind::Float64:
+    case TypedKind::BigInt64:
+    case TypedKind::BigUint64:
         return 8;
     default:
         return 1;
@@ -126,6 +144,8 @@ inline const wchar_t* TypedKindName(TypedKind kind) {
     case TypedKind::Uint32: return L"Uint32Array";
     case TypedKind::Float32: return L"Float32Array";
     case TypedKind::Float64: return L"Float64Array";
+    case TypedKind::BigInt64: return L"BigInt64Array";
+    case TypedKind::BigUint64: return L"BigUint64Array";
     default: return L"TypedArray";
     }
 }
@@ -185,6 +205,8 @@ struct ObjExtra {
     size_t byteLength = 0;
     size_t typedLength = 0;
     TypedKind typedKind = TypedKind::None;
+    // Uretec / async fonksiyon durumu (askiya alinabilir govde)
+    struct Coro* coro = nullptr;
 };
 
 struct Obj : Cell {
@@ -203,6 +225,11 @@ struct Obj : Cell {
 
 struct Binding { Value v; uint8_t kind = 0; /* 0 var, 1 let, 2 const */ };
 
+// Atom: tanimlayici adinin tekil kopyasi (ayni metin -> ayni isaretci). Degisken aramada dize
+// karsilastirmasi yerine isaretci karsilastirmasi yapilir. Tablo surec boyunca yasar (yalnizca adlar).
+using Atom = const std::wstring*;
+Atom AtomOf(const std::wstring& s);
+
 struct Env : Cell {
     Env* parent = nullptr;
     Obj* withObj = nullptr;   // with (obj) kapsami
@@ -210,11 +237,66 @@ struct Env : Cell {
     Value thisVal;
     Obj* func = nullptr;
     Obj* newTarget = nullptr;
-    std::vector<std::pair<std::wstring, Binding>> vars;
-    std::unordered_map<std::wstring, uint32_t> idx;
+    std::vector<std::pair<Atom, Binding>> vars;
+    std::unordered_map<Atom, uint32_t> idx;
 
-    Binding* Find(const std::wstring& k);
-    Binding& Define(const std::wstring& k, uint8_t kind);
+    Binding* Find(Atom a) {
+        if (!idx.empty()) {
+            auto it = idx.find(a);
+            return it == idx.end() ? nullptr : &vars[it->second].second;
+        }
+        for (auto& v : vars) if (v.first == a) return &v.second;
+        return nullptr;
+    }
+    Binding* Find(const std::wstring& k) { return Find(AtomOf(k)); }
+    Binding& Define(Atom a, uint8_t kind);
+    Binding& Define(const std::wstring& k, uint8_t kind) { return Define(AtomOf(k), kind); }
+    void Trace(std::vector<Cell*>& work) override;
+};
+
+// ---------------- Askiya alinabilir yurutme (async/await, ureteçler) ----------------
+// async ve uretec fonksiyonlarinin govdesi, C++ yigini yerine bu acik cerceve yiginiyla
+// yurutulur. Boylece 'await' / 'yield' noktasinda tum durum (ara degerler dahil) GC'nin
+// izledigi bir hucrede saklanir ve fonksiyon daha sonra kaldigi yerden surdurulebilir.
+struct CoFrame {
+    Ast* node = nullptr;
+    Env* env = nullptr;
+    Env* e1 = nullptr;             // dongu / catch / switch kapsami
+    Env* e2 = nullptr;             // yineleme kapsami
+    int pc = 0;                    // dugum icindeki adim
+    bool stmt = false;             // deyim cercevesi mi (ifade degil)
+    size_t idx = 0;                // liste konumu
+    std::vector<Value> vals;       // ara degerler (GC izler)
+    Value cv;                      // saklanan tamamlanma degeri (try/finally)
+    uint8_t ct = 0;                // saklanan tamamlanma turu
+    const std::wstring* clabel = nullptr;
+    std::vector<const std::wstring*> labels;
+    std::wstring key;              // ozellik anahtari
+    int rkind = 0;                 // bilesik atama referansi turu
+    const std::wstring* rname = nullptr;
+};
+
+struct CoReq { int mode = 0; Value v; Obj* promise = nullptr; };   // async uretec istek kuyrugu
+
+struct Coro : Cell {
+    enum Kind : uint8_t { Gen = 1, Async = 2, AsyncGen = 3 };
+    enum State : uint8_t { Start, SuspYield, Running, SuspAwait, Done };
+    enum Outcome : uint8_t { OutNone, OutYield, OutReturn, OutThrow };
+    uint8_t kind = 0;
+    uint8_t state = Start;
+    Env* fenv = nullptr;
+    Obj* fn = nullptr;
+    Obj* holder = nullptr;         // uretec nesnesi ya da async tutucu
+    Obj* promise = nullptr;        // async fonksiyonun dondurdugu Promise
+    std::vector<CoFrame> frames;
+    std::vector<CoReq> queue;
+    // Son biten alt cercevenin sonucu
+    Value res;
+    uint8_t rct = 0;
+    const std::wstring* rlabel = nullptr;
+    // Calismanin sonucu
+    uint8_t outcome = OutNone;
+    Value outVal;
     void Trace(std::vector<Cell*>& work) override;
 };
 
@@ -237,6 +319,14 @@ public:
     virtual void RequestScript(Node* scriptNode, const std::wstring& url) = 0; // dinamik <script src>
     virtual void SubmitForm(Node* form, Node* submitter) = 0;
     virtual void UpdateVideoFrame(const std::wstring& key, uint32_t w, uint32_t h, const std::vector<uint8_t>& bgra) { (void)key; (void)w; (void)h; (void)bgra; }
+    // <video> karelerinin gidecegi yer (oynatici is parcacigindan cagrilir; is parcacigi guvenli olmali)
+    virtual std::function<void(int, int, std::shared_ptr<std::vector<uint8_t>>)> VideoSink(const Node* videoNode) { (void)videoNode; return {}; }
+    // Ag istegi guvenlik politikasi (fetch, XHR, ES modulleri): izleyici engeli, karisik icerik, sema.
+    virtual bool CheckRequest(const std::wstring& url) { (void)url; return true; }
+    // Uzun betiklerde ara ara sorulur: surec bellegi tehlikeli duzeye ciktiysa betik durdurulur
+    virtual bool OverMemory() { return false; }
+    // meros-yt: kaynakli <video> (YouTube yerel oynaticisi) yalnizca merOS YouTube sayfalarinda
+    virtual bool YouTubeStreamAllowed() { return false; }
 };
 
 struct Timer { int id; double due; double interval; Value fn; std::vector<Value> args; };
@@ -257,7 +347,23 @@ struct ModuleRecord {
     bool evaluated = false;
     bool evaluating = false;
     std::unordered_map<std::wstring, Value> exports;
+    std::vector<std::pair<std::wstring, std::wstring>> localExports; // (disa aktarilan ad, yerel ad)
+    void RefreshExports();   // govde bittikten sonra yerel baglarin son degerlerini al
 };
+
+// ---------------- Custom Elements ----------------
+struct CEDef {
+    std::wstring name;
+    Obj* ctor = nullptr;
+    Obj* proto = nullptr;
+    Value connected, disconnected, adopted, attrChanged;   // tanimlama aninda okunan geri cagirmalar
+    std::vector<std::wstring> observed;                    // static observedAttributes
+    bool extends = false;                                  // ozellestirilmis yerlesik oge (desteklenmez, yalnizca kayit)
+};
+// MutationObserver kaydi. flags: 1 childList, 2 attributes, 4 characterData, 8 subtree, 16/32 oldValue
+struct MORegistration { Obj* observer = nullptr; Node* target = nullptr; uint8_t flags = 0; std::vector<std::wstring> filter; };
+// kind: 0 yukseltme, 1 connected, 2 disconnected, 3 attributeChanged
+struct CEReaction { uint8_t kind = 0; Node* node = nullptr; std::wstring name; Value oldV, newV; };
 
 // ---------------- Calisma ortami ----------------
 class Runtime {
@@ -281,6 +387,9 @@ public:
     void RunDueTimers(double nowMs);
     void FireLoadEvents();                       // DOMContentLoaded + load
     bool DispatchClick(Node* target);            // false: varsayilan eylem (link) engellendi
+    // Fare konumlu tiklama: client (gorunur alan) ve page (belge) koordinatlari, CSS px
+    bool DispatchClickAt(Node* target, double clientX, double clientY, double pageX, double pageY);
+    double evClientX = -1, evClientY = -1, evPageX = -1, evPageY = -1;   // DispatchClickAt icin gecici
     bool DispatchSimple(Node* target, const std::wstring& type, bool bubbles); // input/change/submit
     bool DispatchKey(Node* target, const std::wstring& type, const std::wstring& key);
     bool DispatchEvent(Node* target, Obj* event);   // ic kullanim (gorev icinde)
@@ -295,7 +404,7 @@ public:
     // Sinirlar
     uint64_t stepBudget = 60000000;     // gorev basina adim
     size_t maxCells = 6000000;
-    int maxDepth = 180;
+    int maxDepth = 10000;   // JS cagri derinligi (V8 ~11k); asil koruma bayt tabanli CheckStack (stackLimit)
 
     // --------- Motor ici API (yerlesik fonksiyonlar kullanir) ---------
     template <class T> T* Alloc() {
@@ -358,7 +467,7 @@ public:
     Obj *objectProto = nullptr, *functionProto = nullptr, *arrayProto = nullptr, *stringProto = nullptr,
         *numberProto = nullptr, *booleanProto = nullptr, *errorProto = nullptr, *regexpProto = nullptr,
         *dateProto = nullptr, *promiseProto = nullptr, *mapProto = nullptr, *setProto = nullptr,
-        *symbolProto = nullptr, *iteratorProto = nullptr;
+        *symbolProto = nullptr, *iteratorProto = nullptr, *bigintProto = nullptr;
     Obj *arrayBufferProto = nullptr, *typedArrayProto = nullptr, *dataViewProto = nullptr;
     Obj *eventTargetProto = nullptr, *nodeProto = nullptr, *elementProto = nullptr, *textProto = nullptr, *documentProto = nullptr,
         *styleProto = nullptr, *classListProto = nullptr, *eventProto = nullptr, *storageProto = nullptr,
@@ -383,7 +492,21 @@ public:
     std::map<std::wstring, Cookie> cookies;
     std::vector<std::pair<Value, std::vector<Value>>> microtasks;
     uint64_t steps = 0;
+    uint64_t stepCheck = 4096;               // steps bunu gecince StepSlow (butce + kesme denetimi)
+    std::atomic<bool> interrupt{false};      // baska is parcacigindan: gecerli betigi durdur
+    const std::atomic<bool>* extInterrupt = nullptr;   // sekmenin kesme bayragi (arayuz yazar)
+    uint32_t slowCount = 0;
+    void StepSlow();
+    void CountStep() { if (++steps > stepCheck) StepSlow(); }
+    bool Interrupted() const { return interrupt.load(std::memory_order_relaxed) || (extInterrupt && extInterrupt->load(std::memory_order_relaxed)); }
     int depth = 0;
+    int curLine = 0;                 // yorumlanan son dugumun satiri (hata mesajlari icin)
+    const std::wstring* curFile = nullptr;   // yorumlanan betigin adi/URL'si
+    std::shared_ptr<MediaState> media;       // <video>/<audio>, MediaSource (js_media.cpp)
+    struct CallRec { const FuncInfo* fi; int callLine; const std::wstring* callerFile; };
+    std::vector<CallRec> callStack;  // JS cagri yigini (error.stack ve konsol icin)
+    std::wstring StackTrace(size_t maxFrames = 12) const;
+    void FillErrorStack(Obj* e, const std::wstring& head);
     int symbolCounter = 0;
     bool inTask = false;
 
@@ -394,7 +517,30 @@ public:
     size_t stackLimit = 6 * 1024 * 1024;         // bayt (ana bilgisayar buyuk yigin verirse artirir)
     uintptr_t stackBase = 0;
     std::vector<Obj*> unhandled;
-    std::vector<std::vector<Value>*> yieldSinks;
+    Obj *generatorProto = nullptr, *asyncGeneratorProto = nullptr;
+    // Custom Elements + Shadow DOM
+    Obj* shadowRootProto = nullptr;
+    Obj* commentProto = nullptr;
+    std::vector<CEDef> ceDefs;
+    std::unordered_map<std::wstring, int> ceByName;
+    std::unordered_map<std::wstring, Obj*> ceWhenDefined;   // bekleyen whenDefined() Promise'leri
+    std::vector<CEReaction> ceQueue;                        // ozel oge tepki kuyrugu (DOM cagrisi sonunda bosaltilir)
+    size_t ceHead = 0;
+    bool ceFlushing = false;
+    std::vector<std::pair<int, Node*>> ceConstruct;         // yukseltme yigini (HTMLElement kurucusu icin)
+    std::unordered_map<Node*, Node*> templateContent;       // <template>.content parcasi
+    std::unordered_map<Node*, bool> templateFragments;      // icerik parcalari (etkisiz sablon belgesine ait)
+    Node* templateDoc = nullptr;                            // etkisiz sablon belgesi (ozel ogeler yukseltilmez)
+    std::vector<Node*> slotChangePending;
+    std::vector<MORegistration> moRegs;
+    std::vector<Obj*> moPending;
+    bool moScheduled = false;
+    std::unordered_map<const Ast*, Obj*> templateObjects;   // etiketli sablon dizgi dizileri (cagri noktasi basina)
+    void FlushCEReactions();
+    int coroDepth = 0;                           // calisan coroutine sayisi (ic ice)
+    // Uretec / async uretec istekleri: mode 0 next, 1 throw, 2 return
+    Value GeneratorResume(Obj* gen, int mode, const Value& v);
+    Value AsyncGeneratorEnqueue(Obj* gen, int mode, const Value& v);
     void CheckStack();
     Obj* MakeClosure(Ast* fnNode, Env* env);
     Obj* MakeIteratorFromList(std::vector<Value> list);
@@ -418,6 +564,19 @@ private:
 void InstallBuiltins(Runtime& rt);
 void InstallDom(Runtime& rt);
 void InstallIntl(Runtime& rt);
+void InstallCoroutines(Runtime& rt);
+// Medya (js_media.cpp)
+void InstallMedia(Runtime& rt, Obj* elementProto);
+void MediaSrcChanged(Runtime& rt, Node* n);
+void MediaScan(Runtime& rt, Node* root);
+void MediaTogglePlay(Runtime& rt, Node* n);       // <video controls> tiklamasi          // ayristirilmis/eklenmis <video>/<audio> ogelerini yukle
+void MediaTick(Runtime& rt);
+double MediaNextDue(Runtime& rt);                 // -1: medya etkin degil
+void MediaGcRoots(Runtime& rt, std::vector<Cell*>& work);
+// js_dom.cpp yardimcilari
+void JsDispatchObj(Runtime& rt, Obj* target, const std::wstring& type);
+Obj* JsNativeCtor(Runtime& rt, const wchar_t* name, NativeFn fn, Obj* proto);
+void InstallBigInt(Runtime& rt);
 double ParseDate(const std::wstring& in);
 
 inline double GetTypedElementNum(const ObjExtra& x, size_t index) {
@@ -448,6 +607,12 @@ inline double GetTypedElementNum(const ObjExtra& x, size_t index) {
     case TypedKind::Float64: {
         double v; memcpy(&v, ptr, 8); return v;
     }
+    case TypedKind::BigInt64: {
+        int64_t v; memcpy(&v, ptr, 8); return double(v);
+    }
+    case TypedKind::BigUint64: {
+        uint64_t v; memcpy(&v, ptr, 8); return double(v);
+    }
     default:
         return 0;
     }
@@ -455,6 +620,13 @@ inline double GetTypedElementNum(const ObjExtra& x, size_t index) {
 
 inline Value GetTypedElement(const ObjExtra& x, size_t index) {
     if (index >= x.typedLength) return Value();
+    if (x.typedKind == TypedKind::BigInt64 || x.typedKind == TypedKind::BigUint64) {
+        size_t bytePos = x.byteOffset + index * 8;
+        if (!x.bufferData || bytePos + 8 > x.bufferData->size()) return Value();
+        uint64_t u;
+        memcpy(&u, x.bufferData->data() + bytePos, 8);
+        return x.typedKind == TypedKind::BigInt64 ? BigFromI64(int64_t(u)) : BigFromU64(u);
+    }
     return Value::N(GetTypedElementNum(x, index));
 }
 
@@ -464,6 +636,11 @@ inline void SetTypedElement(Runtime& rt, ObjExtra& x, size_t index, const Value&
     size_t bytePos = x.byteOffset + index * elSize;
     if (bytePos + elSize > x.bufferData->size()) return;
     uint8_t* ptr = x.bufferData->data() + bytePos;
+    if (x.typedKind == TypedKind::BigInt64 || x.typedKind == TypedKind::BigUint64) {
+        uint64_t u = BigToU64Wrap(rt, v);
+        memcpy(ptr, &u, 8);
+        return;
+    }
     double n = rt.ToNum(v);
     switch (x.typedKind) {
     case TypedKind::Int8: {

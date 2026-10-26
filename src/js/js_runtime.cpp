@@ -12,6 +12,8 @@
 #include "../url.h"
 #include "../util.h"
 #include "js_ast.h"
+#include "js_bigint.h"
+#include <mutex>
 
 namespace mer {
 namespace js {
@@ -91,18 +93,39 @@ void Obj::Trace(std::vector<Cell*>& w) {
     for (auto& r : x->reactions) { PushV(w, r.onFul); PushV(w, r.onRej); if (r.derived) w.push_back(r.derived); }
     for (auto& l : x->listeners) PushV(w, l.fn);
     if (x->arrayBufferObj) w.push_back(x->arrayBufferObj);
+    if (x->coro) w.push_back(x->coro);
 }
 
-Binding* Env::Find(const std::wstring& k) {
-    if (!idx.empty()) {
-        auto it = idx.find(k);
-        return it == idx.end() ? nullptr : &vars[it->second].second;
+void Coro::Trace(std::vector<Cell*>& w) {
+    if (fenv) w.push_back(fenv);
+    if (fn) w.push_back(fn);
+    if (holder) w.push_back(holder);
+    if (promise) w.push_back(promise);
+    PushV(w, res);
+    PushV(w, outVal);
+    for (auto& f : frames) {
+        if (f.env) w.push_back(f.env);
+        if (f.e1) w.push_back(f.e1);
+        if (f.e2) w.push_back(f.e2);
+        for (auto& v : f.vals) PushV(w, v);
+        PushV(w, f.cv);
     }
-    for (auto& v : vars) if (v.first == k) return &v.second;
-    return nullptr;
+    for (auto& q : queue) { PushV(w, q.v); if (q.promise) w.push_back(q.promise); }
 }
 
-Binding& Env::Define(const std::wstring& k, uint8_t kind) {
+Atom AtomOf(const std::wstring& s) {
+    static std::mutex mu;
+    static std::unordered_map<std::wstring, std::unique_ptr<std::wstring>> table;
+    std::lock_guard<std::mutex> g(mu);
+    auto it = table.find(s);
+    if (it != table.end()) return it->second.get();
+    std::unique_ptr<std::wstring> p(new std::wstring(s));
+    Atom a = p.get();
+    table.emplace(s, std::move(p));
+    return a;
+}
+
+Binding& Env::Define(Atom k, uint8_t kind) {
     if (Binding* b = Find(k)) { if (kind > b->kind) b->kind = kind; return *b; }
     vars.emplace_back(k, Binding());
     vars.back().second.kind = kind;
@@ -118,6 +141,16 @@ void Env::Trace(std::vector<Cell*>& w) {
     if (func) w.push_back(func);
     if (newTarget) w.push_back(newTarget);
     for (auto& v : vars) PushV(w, v.second.v);
+}
+
+Value BigFromI64(int64_t v) { return BigVal(BigNum::FromI64(v)); }
+Value BigFromU64(uint64_t v) { return BigVal(BigNum::FromU64(v)); }
+uint64_t BigToU64Wrap(Runtime& rt, const Value& v0) {
+    Value v = rt.ToPrimitive(v0, 1);
+    if (v.IsBig()) return BigOf(v).LowU64();
+    if (v.t == Value::Bool) return v.b ? 1 : 0;
+    if (v.IsStr()) { BigNum b; if (BigParse(*v.s, b)) return b.LowU64(); rt.Throw(L"SyntaxError", L"Cannot convert " + *v.s + L" to a BigInt"); }
+    rt.Throw(L"TypeError", L"Cannot convert " + rt.ToStr(v) + L" to a BigInt");
 }
 
 // ---------------- Runtime ----------------
@@ -137,6 +170,8 @@ Runtime::Runtime() {
     globalEnv->thisVal = Value::O(global);
     InstallBuiltins(*this);
     InstallIntl(*this);
+    InstallCoroutines(*this);
+    InstallBigInt(*this);
 }
 
 Runtime::~Runtime() {
@@ -259,8 +294,47 @@ Obj* Runtime::NewError(const wchar_t* ctorName, const std::wstring& msg) {
     Obj* e = NewObject(proto);
     e->cls = Cls::Error;
     DefineData(e, L"message", Value::S(msg), false);
-    DefineData(e, L"stack", Value::S(std::wstring(ctorName) + L": " + msg), false);
+    FillErrorStack(e, std::wstring(ctorName) + L": " + msg);
     return e;
+}
+
+static std::wstring ShortFile(const std::wstring* f) {
+    if (!f || f->empty()) return L"<anonymous>";
+    std::wstring s = *f;
+    size_t q = s.find_first_of(L"?#");
+    if (q != std::wstring::npos) s.erase(q);
+    size_t sl = s.find_last_of(L'/');
+    if (sl != std::wstring::npos && sl + 1 < s.size()) s = s.substr(sl + 1);
+    return s;
+}
+
+std::wstring Runtime::StackTrace(size_t maxFrames) const {
+    // en ustteki cerceve: su anki fonksiyon, curFile:curLine
+    std::wstring out;
+    int line = curLine;
+    const std::wstring* file = curFile;
+    size_t n = callStack.size();
+    for (size_t k = 0; k <= n && k < maxFrames; k++) {
+        size_t i = n - k;   // i==0: betik ust duzeyi
+        if (i == 0 && n > 0 && !file) break;   // zamanlayici/olay: ust duzey betik cercevesi yok
+        std::wstring name;
+        if (i > 0) { const FuncInfo* fi = callStack[i - 1].fi; name = fi && !fi->name.empty() ? fi->name : L"<anonymous>"; }
+        out += L"\n    at ";
+        out += i > 0 ? name + L" (" : std::wstring();
+        out += (file ? *file : std::wstring(L"<anonymous>")) + L":" + std::to_wstring(line);
+        if (i > 0) out += L")";
+        if (i == 0) break;
+        line = callStack[i - 1].callLine;
+        file = callStack[i - 1].callerFile;
+    }
+    if (n + 1 > maxFrames) out += L"\n    ... (" + std::to_wstring(n + 1 - maxFrames) + L" cerceve daha)";
+    return out;
+}
+
+void Runtime::FillErrorStack(Obj* e, const std::wstring& head) {
+    DefineData(e, L"stack", Value::S(head + StackTrace()), false);
+    if (curLine > 0) DefineData(e, L"\x02line", Value::N(curLine), false);
+    if (curFile) DefineData(e, L"\x02file", Value::S(*curFile), false);
 }
 
 void Runtime::Throw(const wchar_t* ctorName, const std::wstring& msg) {
@@ -296,6 +370,7 @@ bool Runtime::Truthy(const Value& v) const {
     case Value::Bool: return v.b;
     case Value::Num: return !(v.n == 0 || std::isnan(v.n));
     case Value::String: return !v.s->empty();
+    case Value::BigInt: return v.s->size() > 1;   // 0n disinda dogru
     default: return true;
     }
 }
@@ -396,6 +471,7 @@ double Runtime::ToNum(const Value& v) {
     case Value::Num: return v.n;
     case Value::String: return StrToNum(*v.s);
     case Value::Symbol: Throw(L"TypeError", L"Cannot convert a Symbol value to a number");
+    case Value::BigInt: Throw(L"TypeError", L"Cannot convert a BigInt value to a number");
     case Value::Object: return ToNum(ToPrimitive(v, 1));
     }
     return NAN;
@@ -414,6 +490,7 @@ std::wstring Runtime::ToStr(const Value& v) {
     case Value::Num: return NumToStr(v.n);
     case Value::String: return *v.s;
     case Value::Symbol: Throw(L"TypeError", L"Cannot convert a Symbol value to a string");
+    case Value::BigInt: return BigToString(BigOf(v), 10);
     case Value::Object: return ToStr(ToPrimitive(v, 2));
     }
     return L"";
@@ -434,6 +511,7 @@ Obj* Runtime::ToObject(const Value& v) {
     case Value::Num: { Obj* o = NewObject(numberProto); o->cls = Cls::NumBox; o->X().num = v.n; return o; }
     case Value::Bool: { Obj* o = NewObject(booleanProto); o->cls = Cls::BoolBox; o->X().num = v.b ? 1 : 0; return o; }
     case Value::Symbol: { Obj* o = NewObject(symbolProto); o->cls = Cls::Symbol_; o->X().str = *v.s; return o; }
+    case Value::BigInt: { Obj* o = NewObject(bigintProto); DefineData(o, L"\x02big", v, false); return o; }
     }
     return NewObject();
 }
@@ -444,7 +522,7 @@ bool Runtime::StrictEq(const Value& a, const Value& b) const {
     case Value::Undef: case Value::Null: return true;
     case Value::Bool: return a.b == b.b;
     case Value::Num: return a.n == b.n;
-    case Value::String: case Value::Symbol: return a.s == b.s || *a.s == *b.s;
+    case Value::String: case Value::Symbol: case Value::BigInt: return a.s == b.s || *a.s == *b.s;
     case Value::Object: return a.o == b.o;
     }
     return false;
@@ -459,6 +537,18 @@ bool Runtime::LooseEq(const Value& a, const Value& b) {
     if (a.t == b.t) return StrictEq(a, b);
     if (a.IsNullish() && b.IsNullish()) return true;
     if (a.IsNullish() || b.IsNullish()) return false;
+    if (a.t == Value::BigInt || b.t == Value::BigInt) {
+        const Value& x = a.t == Value::BigInt ? a : b;
+        const Value& y = a.t == Value::BigInt ? b : a;
+        if (y.t == Value::Num) {
+            if (!std::isfinite(y.n) || y.n != std::trunc(y.n)) return false;
+            return BigCmp(BigOf(x), BigNum::FromDouble(y.n)) == 0;
+        }
+        if (y.t == Value::String) { BigNum p; return BigParse(*y.s, p) && BigCmp(BigOf(x), p) == 0; }
+        if (y.t == Value::Bool) return BigCmp(BigOf(x), BigNum::FromI64(y.b ? 1 : 0)) == 0;
+        if (y.IsObj()) return LooseEq(x, ToPrimitive(y, 0));
+        return false;
+    }
     if (a.t == Value::Num && b.t == Value::String) return a.n == ToNum(b);
     if (a.t == Value::String && b.t == Value::Num) return ToNum(a) == b.n;
     if (a.t == Value::Bool) return LooseEq(Value::N(a.b ? 1 : 0), b);
@@ -476,6 +566,7 @@ std::wstring Runtime::TypeOf(const Value& v) const {
     case Value::Num: return L"number";
     case Value::String: return L"string";
     case Value::Symbol: return L"symbol";
+    case Value::BigInt: return L"bigint";
     case Value::Object: return v.o->IsCallable() ? L"function" : L"object";
     }
     return L"undefined";
@@ -501,6 +592,7 @@ std::wstring Runtime::MapKey(const Value& v) {
     case Value::Num: return std::isnan(v.n) ? L"dNaN" : L"d" + NumToStr(v.n == 0 ? 0 : v.n);
     case Value::String: return L"s" + *v.s;
     case Value::Symbol: return L"y" + *v.s;
+    case Value::BigInt: return L"b" + *v.s;
     case Value::Object: { wchar_t buf[32]; swprintf(buf, 32, L"o%p", static_cast<void*>(v.o)); return buf; }
     }
     return L"?";
@@ -533,8 +625,8 @@ static Value GetChain(Runtime& rt, Obj* start, const std::wstring& key, const Va
             if (key == L"length") return Value::N(double(p->elems.size()));
             uint32_t idx;
             if (ParseIndex(key, idx)) {
-                if (idx < p->elems.size()) return p->elems[idx];
-                continue;
+                if (idx < p->elems.size() && !p->elems[idx].IsHole()) return p->elems[idx];
+                continue;   // bosluk: prototip zincirinde ara
             }
         } else if (p->cls == Cls::TypedArray && p->x) {
             if (key == L"length") return Value::N(double(p->x->typedLength));
@@ -619,6 +711,7 @@ Value Runtime::Get(const Value& o, const std::wstring& key) {
     case Value::Symbol:
         if (key == L"description") { size_t p = o.s->find(L':', 1); return Value::S(p == std::wstring::npos ? L"" : o.s->substr(p + 1)); }
         return GetChain(*this, symbolProto, key, o);
+    case Value::BigInt: return GetChain(*this, bigintProto, key, o);
     case Value::Object: return GetChain(*this, o.o, key, o);
     }
     return Value();
@@ -627,7 +720,7 @@ Value Runtime::Get(const Value& o, const std::wstring& key) {
 Value Runtime::GetV(const Value& o, const Value& key) {
     uint32_t idx;
     if (NumIndex(key, idx)) {
-        if (o.IsObj() && (o.o->cls == Cls::Array || o.o->cls == Cls::Arguments) && idx < o.o->elems.size()) return o.o->elems[idx];
+        if (o.IsObj() && (o.o->cls == Cls::Array || o.o->cls == Cls::Arguments) && idx < o.o->elems.size() && !o.o->elems[idx].IsHole()) return o.o->elems[idx];
         if (o.IsObj() && o.o->cls == Cls::TypedArray && o.o->x && idx < o.o->x->typedLength) return GetTypedElement(*o.o->x, idx);
         if (o.IsStr()) return idx < o.s->size() ? Value::S(std::wstring(1, (*o.s)[idx])) : Value();
     }
@@ -638,7 +731,7 @@ Value Runtime::GetV(const Value& o, const Value& key) {
 static void ArraySetLength(Runtime& rt, Obj* a, const Value& v) {
     double n = rt.ToNum(v);
     if (!(n >= 0) || n != std::floor(n) || n > 50000000) rt.Throw(L"RangeError", L"Invalid array length");
-    a->elems.resize(size_t(n));
+    a->elems.resize(size_t(n), Value::Hole());
 }
 
 void Runtime::Put(const Value& o, const std::wstring& key, const Value& v) {
@@ -650,8 +743,8 @@ void Runtime::Put(const Value& o, const std::wstring& key, const Value& v) {
         if (key == L"length") { ArraySetLength(*this, obj, v); return; }
         uint32_t idx;
         if (ParseIndex(key, idx)) {
-            if (idx < obj->elems.size()) { obj->elems[idx] = v; return; }
-            if (idx < obj->elems.size() + 1000000 && idx < 50000000) { obj->elems.resize(size_t(idx) + 1); obj->elems[idx] = v; return; }
+            if (idx < obj->elems.size()) { obj->elems[idx] = Unhole(v); return; }
+            if (idx < obj->elems.size() + 1000000 && idx < 50000000) { obj->elems.resize(size_t(idx) + 1, Value::Hole()); obj->elems[idx] = Unhole(v); return; }
             Throw(L"RangeError", L"Invalid array length");
         }
     } else if (obj->cls == Cls::Arguments) {
@@ -692,8 +785,8 @@ void Runtime::PutV(const Value& o, const Value& key, const Value& v) {
     uint32_t idx;
     if (o.IsObj() && o.o->cls == Cls::Array && !o.o->frozen && NumIndex(key, idx)) {
         Obj* a = o.o;
-        if (idx < a->elems.size()) { a->elems[idx] = v; return; }
-        if (idx < a->elems.size() + 1000000 && idx < 50000000) { a->elems.resize(size_t(idx) + 1); a->elems[idx] = v; return; }
+        if (idx < a->elems.size()) { a->elems[idx] = Unhole(v); return; }
+        if (idx < a->elems.size() + 1000000 && idx < 50000000) { a->elems.resize(size_t(idx) + 1, Value::Hole()); a->elems[idx] = Unhole(v); return; }
     }
     if (o.IsObj() && o.o->cls == Cls::TypedArray && !o.o->frozen && NumIndex(key, idx)) {
         if (o.o->x && idx < o.o->x->typedLength) SetTypedElement(*this, *o.o->x, idx, v);
@@ -706,7 +799,7 @@ bool Runtime::HasOwn(Obj* o, const std::wstring& key) {
     if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
         if (key == L"length") return true;
         uint32_t idx;
-        if (ParseIndex(key, idx)) return idx < o->elems.size();
+        if (ParseIndex(key, idx)) return idx < o->elems.size() && !o->elems[idx].IsHole();
     }
     if (o->cls == Cls::TypedArray && o->x) {
         if (key == L"length" || key == L"byteLength" || key == L"byteOffset" || key == L"buffer") return true;
@@ -742,10 +835,7 @@ bool Runtime::Delete(Obj* o, const std::wstring& key) {
     if (o->cls == Cls::Array) {
         uint32_t idx;
         if (ParseIndex(key, idx)) {
-            if (idx < o->elems.size()) {
-                if (idx + 1 == o->elems.size()) o->elems[idx] = Value();
-                else o->elems[idx] = Value();
-            }
+            if (idx < o->elems.size()) o->elems[idx] = Value::Hole();
             return true;
         }
     }
@@ -757,7 +847,7 @@ bool Runtime::Delete(Obj* o, const std::wstring& key) {
 std::vector<std::wstring> Runtime::OwnKeys(Obj* o, bool onlyEnum) {
     std::vector<std::wstring> keys;
     if (o->cls == Cls::Array || o->cls == Cls::Arguments) {
-        for (size_t i = 0; i < o->elems.size(); i++) keys.push_back(std::to_wstring(i));
+        for (size_t i = 0; i < o->elems.size(); i++) if (!o->elems[i].IsHole()) keys.push_back(std::to_wstring(i));
     } else if (o->cls == Cls::TypedArray && o->x) {
         for (size_t i = 0; i < o->x->typedLength; i++) keys.push_back(std::to_wstring(i));
     } else if (o->cls == Cls::StrBox && o->x) {
@@ -793,13 +883,16 @@ Value Runtime::Call(const Value& f, const Value& thisV, std::vector<Value>& args
         a.insert(a.end(), args.begin(), args.end());
         return Call(Value::O(fo->x->boundTarget), fo->x->boundThis, a);
     }
-    if (++steps > stepBudget) throw JSAbort{L"betik çok uzun sürdü"};
+    CountStep();
     if (fo->x && fo->x->native) {
         CheckStack();
         Obj* saved = nativeNewTarget;
         nativeNewTarget = nullptr;
         struct R { Obj*& r; Obj* v; ~R() { r = v; } } restore{nativeNewTarget, saved};
-        return fo->x->native(*this, fo, thisV, args);
+        Value r = fo->x->native(*this, fo, thisV, args);
+        // DOM cagrisinin sonunda ozel oge tepkileri (connected/attributeChanged/yukseltme)
+        if (ceHead < ceQueue.size() && !ceFlushing) FlushCEReactions();
+        return r;
     }
     if (fo->x && fo->x->classKind) Throw(L"TypeError", L"Class constructor " + fo->x->name + L" cannot be invoked without 'new'");
     if (!fo->x || !fo->x->fn) return Value();
@@ -818,8 +911,11 @@ std::vector<Value> Runtime::IterateToList(const Value& it, size_t limit) {
     }
     if (it.IsObj()) {
         Obj* o = it.o;
-        if (o->cls == Cls::Array && Get(Value::O(arrayProto), L"\x01Symbol.iterator").o == Get(it, L"\x01Symbol.iterator").o) return o->elems;
-        if (o->cls == Cls::Arguments) return o->elems;
+        if ((o->cls == Cls::Array && Get(Value::O(arrayProto), L"\x01Symbol.iterator").o == Get(it, L"\x01Symbol.iterator").o) || o->cls == Cls::Arguments) {
+            out = o->elems;
+            for (auto& v : out) if (v.IsHole()) v = Value();   // yineleme bosluklari undefined olarak verir
+            return out;
+        }
         if (o->cls == Cls::TypedArray && o->x) {
             for (size_t i = 0; i < o->x->typedLength; i++) out.push_back(GetTypedElement(*o->x, i));
             return out;
@@ -992,8 +1088,19 @@ void Runtime::RunMicrotasks() {
 
 // ---------------- Gorevler, zamanlayicilar, GC ----------------
 
+// Adim sayaci esigi asildi: butce ve kesme (sekme donmasi / kullanici durdurdu) denetimi.
+// Sicak yolda yalnizca bir karsilastirma kalir; atomik bayrak her 4096 adimda bir okunur.
+void Runtime::StepSlow() {
+    if (steps > stepBudget) throw JSAbort{L"betik çok uzun sürdü (sonsuz döngü?)"};
+    if (Interrupted()) throw JSAbort{L"betik durduruldu (sayfa yanıt vermiyordu)"};
+    // ~64K adimda bir: tek gorevde biriken cop (GC gorevler arasinda calisir) sureci bogmasin
+    if ((++slowCount & 15) == 0 && host && host->OverMemory()) throw JSAbort{L"bellek sınırı aşıldı (sayfa çok fazla bellek kullanıyor)"};
+    stepCheck = std::min(stepBudget, steps + 4096);
+}
+
 void Runtime::BeginTask() {
     steps = 0;
+    stepCheck = std::min<uint64_t>(stepBudget, 4096);
     depth = 0;
     char probe = 0;
     stackBase = reinterpret_cast<uintptr_t>(&probe);
@@ -1012,6 +1119,23 @@ void Runtime::Report(const std::wstring& where, const JSThrow& t) {
             std::wstring name = ToStr(Get(t.v, L"name"));
             std::wstring m = ToStr(Get(t.v, L"message"));
             msg = name + L": " + m;
+            Value ln = Get(t.v, L"\x02line");
+            Value fl = Get(t.v, L"\x02file");
+            std::wstring fs = fl.IsStr() ? ShortFile(fl.s.get()) : std::wstring();
+            if (ln.IsNum()) msg += L" (" + (fs.empty() ? std::wstring() : fs + L", ") + L"sat\u0131r " + NumToStr(ln.n) + L")";
+            // yigin: ilk birkac cerceve (hangi betik/fonksiyon oldugunu gormek icin)
+            Value st = Get(t.v, L"stack");
+            if (st.IsStr()) {
+                std::wstring sv = *st.s;
+                size_t nlp = sv.find(L"\n");
+                if (nlp != std::wstring::npos) {
+                    std::wstring frames = sv.substr(nlp);
+                    int cnt = 0; size_t pos = 0;
+                    while (cnt < 6 && (pos = frames.find(L"\n", pos)) != std::wstring::npos) { pos++; cnt++; }
+                    if (pos != std::wstring::npos && cnt == 6) frames.erase(pos - 1);
+                    msg += frames;
+                }
+            }
         } else msg = L"Uncaught " + Inspect(t.v);
     } catch (...) {
         msg = L"Uncaught (hata)";
@@ -1024,10 +1148,15 @@ void Runtime::Report(const std::wstring& where, const JSThrow& t) {
 double Runtime::NextTimerDue() const {
     double best = -1;
     for (auto& t : timers) if (best < 0 || t.due < best) best = t.due;
+    if (media) {
+        double m = MediaNextDue(const_cast<Runtime&>(*this));
+        if (m >= 0 && (best < 0 || m < best)) best = m;
+    }
     return best;
 }
 
 void Runtime::RunDueTimers(double now) {
+    if (media && !inTask) MediaTick(*this);   // oynatici durumu -> medya olaylari
     // her cagrida en fazla 64 zamanlayici (sonsuz dongu koruma)
     for (int round = 0; round < 64; round++) {
         size_t pick = size_t(-1);
@@ -1072,7 +1201,7 @@ void Runtime::Collect() {
                      regexpProto, dateProto, promiseProto, mapProto, setProto, symbolProto, iteratorProto,
                      arrayBufferProto, typedArrayProto, dataViewProto,
                      eventTargetProto, nodeProto, elementProto, textProto, documentProto, styleProto, classListProto, eventProto, storageProto,
-                     mediaSourceProto, sourceBufferProto, blobProto, global};
+                     mediaSourceProto, sourceBufferProto, blobProto, bigintProto, generatorProto, asyncGeneratorProto, shadowRootProto, commentProto, global};
     for (Obj* p : protos) root(p);
     root(globalEnv);
     for (auto& c : ctors) root(c.second);
@@ -1081,6 +1210,16 @@ void Runtime::Collect() {
     for (auto& t : timers) { PushV(work, t.fn); for (auto& a : t.args) PushV(work, a); }
     for (auto& m : microtasks) { PushV(work, m.first); for (auto& a : m.second) PushV(work, a); }
     for (Obj* p : unhandled) root(p);
+    for (auto& d : ceDefs) {
+        root(d.ctor); root(d.proto);
+        PushV(work, d.connected); PushV(work, d.disconnected); PushV(work, d.adopted); PushV(work, d.attrChanged);
+    }
+    for (auto& w : ceWhenDefined) root(w.second);
+    for (auto& r : moRegs) root(r.observer);
+    for (Obj* o : moPending) root(o);
+    for (auto& t : templateObjects) root(t.second);
+    for (auto& r : ceQueue) { PushV(work, r.oldV); PushV(work, r.newV); }
+    MediaGcRoots(*this, work);
     for (auto& m : modules) {
         if (m.second) {
             root(m.second->namespaceObj);
@@ -1127,6 +1266,7 @@ bool Runtime::RunScript(const std::wstring& src, const std::wstring& name, Node*
     bool ok = true;
     try {
         EvalAst(s->root, globalEnv);
+        if (ceHead < ceQueue.size()) FlushCEReactions();
         if (!nested) RunMicrotasks();
     } catch (JSThrow& t) {
         Report(name, t);
@@ -1144,40 +1284,20 @@ bool Runtime::RunScript(const std::wstring& src, const std::wstring& name, Node*
     return ok;
 }
 
-static bool ReadModuleSource(const std::wstring& url, std::wstring& outText) {
-    if (url.rfind(L"http://", 0) == 0 || url.rfind(L"https://", 0) == 0) {
-        FetchResult res = Fetch(url, 4 * 1024 * 1024);
-        if (res.ok && res.status < 400) {
-            outText = DecodeBody(res.body, res.contentType);
-            return true;
-        }
-        return false;
-    }
-    std::wstring filePath = url;
-    if (filePath.rfind(L"file:///", 0) == 0) {
-        filePath = filePath.substr(8);
-    } else if (filePath.rfind(L"file://", 0) == 0) {
-        filePath = filePath.substr(7);
-    }
-    for (auto& ch : filePath) {
-        if (ch == L'/') ch = L'\\';
-    }
-    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-    DWORD sz = GetFileSize(hFile, nullptr);
-    if (sz == INVALID_FILE_SIZE || sz > 8 * 1024 * 1024) {
-        CloseHandle(hFile);
-        return false;
-    }
-    std::string buf(sz, '\0');
-    DWORD read = 0;
-    if (!ReadFile(hFile, &buf[0], sz, &read, nullptr) || read != sz) {
-        CloseHandle(hFile);
-        return false;
-    }
-    CloseHandle(hFile);
-    outText = FromUtf8(reinterpret_cast<const uint8_t*>(buf.data()), buf.size());
+// Modul kaynagi: yalnizca ag katmani uzerinden (file: yollari net katmaninda dogrulanir;
+// hangi adreslere izin verildigine Host::CheckRequest karar verir).
+static bool ReadModuleSource(const std::wstring& url, std::wstring& outText, const std::wstring& docUrl) {
+    FetchOptions ro = SubresourceOpts(docUrl, url);
+    FetchResult res = Fetch(url, 48 * 1024 * 1024, nullptr, 0, &ro);
+    if (!res.ok || res.status >= 400 || res.truncated) return false;
+    outText = DecodeBody(res.body, res.contentType);
     return true;
+}
+
+void ModuleRecord::RefreshExports() {
+    if (!env) return;
+    for (auto& le : localExports)
+        if (Binding* b = env->Find(le.second)) exports[le.first] = b->v;
 }
 
 std::shared_ptr<ModuleRecord> Runtime::LoadModuleInternal(const std::wstring& url, const std::wstring& referrer) {
@@ -1202,7 +1322,10 @@ std::shared_ptr<ModuleRecord> Runtime::LoadModuleInternal(const std::wstring& ur
     modules[resolved] = mod;
 
     std::wstring srcText;
-    if (!ReadModuleSource(resolved, srcText)) {
+    if (host && !host->CheckRequest(resolved)) {
+        Throw(L"TypeError", L"Module blocked by merOS Shield security policy: " + resolved);
+    }
+    if (!ReadModuleSource(resolved, srcText, host ? host->PageUrl() : std::wstring())) {
         Throw(L"TypeError", L"Failed to fetch module: " + resolved);
     }
 
@@ -1224,6 +1347,7 @@ std::shared_ptr<ModuleRecord> Runtime::LoadModuleInternal(const std::wstring& ur
         EvalAst(s->root, mod->env);
         mod->evaluated = true;
         mod->evaluating = false;
+        mod->RefreshExports();
         for (const auto& exp : mod->exports) {
             DefineData(mod->namespaceObj, exp.first, exp.second, true);
         }
@@ -1299,6 +1423,7 @@ bool Runtime::RunModule(const std::wstring& src, const std::wstring& url, Node* 
         EvalAst(s->root, mod->env);
         mod->evaluated = true;
         mod->evaluating = false;
+        mod->RefreshExports();
         for (const auto& exp : mod->exports) {
             DefineData(mod->namespaceObj, exp.first, exp.second, true);
         }
@@ -1377,6 +1502,7 @@ std::wstring Runtime::Inspect(const Value& v, int d) {
     switch (v.t) {
     case Value::String: return d == 0 ? *v.s : L"\"" + *v.s + L"\"";
     case Value::Symbol: return L"Symbol(" + ToStr(Get(v, L"description")) + L")";
+    case Value::BigInt: return ToStr(v) + L"n";
     case Value::Object: {
         Obj* o = v.o;
         if (d > 2) return o->cls == Cls::Array ? L"[Array]" : L"[Object]";

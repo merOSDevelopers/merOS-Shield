@@ -51,6 +51,13 @@ const std::unordered_map<std::wstring, uint32_t>& EntityTable() {
         {L"micro", 0xB5}, {L"not", 0xAC}, {L"ordf", 0xAA}, {L"ordm", 0xBA}, {L"dagger", 0x2020},
         {L"lsaquo", 0x2039}, {L"rsaquo", 0x203A}, {L"star", 0x2606}, {L"starf", 0x2605}, {L"le", 0x2264},
         {L"ge", 0x2265}, {L"ne", 0x2260}, {L"infin", 0x221E}, {L"minus", 0x2212}, {L"crarr", 0x21B5},
+        {L"asymp", 0x2248}, {L"equiv", 0x2261}, {L"part", 0x2202}, {L"empty", 0x2205}, {L"nabla", 0x2207},
+        {L"isin", 0x2208}, {L"notin", 0x2209}, {L"radic", 0x221A}, {L"prop", 0x221D}, {L"ang", 0x2220},
+        {L"and", 0x2227}, {L"or", 0x2228}, {L"cap", 0x2229}, {L"cup", 0x222A}, {L"int", 0x222B},
+        {L"there4", 0x2234}, {L"sim", 0x223C}, {L"cong", 0x2245}, {L"sub", 0x2282}, {L"sup", 0x2283},
+        {L"nsub", 0x2284}, {L"sube", 0x2286}, {L"supe", 0x2287}, {L"oplus", 0x2295}, {L"otimes", 0x2297},
+        {L"perp", 0x22A5}, {L"sdot", 0x22C5}, {L"spades", 0x2660}, {L"clubs", 0x2663}, {L"diams", 0x2666},
+        {L"loz", 0x25CA},
     };
     return t;
 }
@@ -91,14 +98,24 @@ public:
                 if (c == L'!') {
                     if (s_.compare(i_, 4, L"<!--") == 0) {
                         size_t e = s_.find(L"-->", i_ + 4);
+                        AddComment(s_.substr(i_ + 4, (e == std::wstring::npos ? n : e) - (i_ + 4)));
                         i_ = (e == std::wstring::npos) ? n : e + 3;
                     } else {
                         size_t e = s_.find(L'>', i_);
+                        // <!DOCTYPE> atlanir; diger <!...> sahte yorumdur
+                        std::wstring body = s_.substr(i_ + 2, (e == std::wstring::npos ? n : e) - (i_ + 2));
+                        if (ToLower(body.substr(0, 7)) != L"doctype") AddComment(body);
                         i_ = (e == std::wstring::npos) ? n : e + 1;
                     }
                     continue;
                 }
-                if (c == L'?') { size_t e = s_.find(L'>', i_); i_ = (e == std::wstring::npos) ? n : e + 1; continue; }
+                if (c == L'?') {
+                    // <?...> HTML'de sahte yorum olur (lit-html isaretleri bunu kullanir)
+                    size_t e = s_.find(L'>', i_);
+                    AddComment(s_.substr(i_ + 1, (e == std::wstring::npos ? n : e) - (i_ + 1)));
+                    i_ = (e == std::wstring::npos) ? n : e + 1;
+                    continue;
+                }
                 if (c == L'/') {
                     if (i_ + 2 < n && iswalpha(s_[i_ + 2])) { EndTag(); continue; }
                     size_t e = s_.find(L'>', i_); i_ = (e == std::wstring::npos) ? n : e + 1;
@@ -146,6 +163,16 @@ private:
         k.push_back(std::move(n));
     }
     void AddText(const std::wstring& t) { AddTextTo(Cur(), t); }
+    void AddComment(const std::wstring& t) {
+        Node* parent = Cur();
+        if (!parent || doc_.count >= kMaxNodes || t.size() > 1000000) return;
+        std::unique_ptr<Node> n(new Node());
+        n->kind = Node::Comment;
+        n->text = t;
+        n->parent = parent;
+        n->id = doc_.count++;
+        parent->kids.push_back(std::move(n));
+    }
 
     std::wstring ReadName() {
         std::wstring nm;
@@ -182,6 +209,12 @@ private:
             if (stack_[k]->name == nm) { PopTo(k); return; }
             // tablo sinirini asma (bozuk HTML'in tum agaci kapatmasini onler)
             if ((stack_[k]->name == L"table") && nm != L"table") return;
+            if ((stack_[k]->name == L"td" || stack_[k]->name == L"th") && nm != L"td" && nm != L"th" && nm != L"tr" && nm != L"tbody" && nm != L"thead" && nm != L"tfoot" && nm != L"table") {
+                if (In(nm, {L"span", L"a", L"b", L"i", L"em", L"strong", L"u", L"s", L"small", L"font", L"code", L"sub", L"sup", L"label", L"button"})) return;
+            }
+            if (In(nm, {L"span", L"b", L"i", L"em", L"strong", L"u", L"s", L"small", L"font", L"code", L"sub", L"sup", L"label"}) &&
+                In(stack_[k]->name, {L"div", L"p", L"ul", L"ol", L"li", L"dl", L"dt", L"dd", L"section", L"article", L"main", L"aside", L"header", L"footer", L"nav", L"form", L"fieldset", L"blockquote", L"details", L"dialog", L"figure", L"body", L"html"})) return;
+            if ((stack_[k]->name == L"body" || stack_[k]->name == L"html") && nm != L"body" && nm != L"html") return;
         }
     }
 
@@ -245,11 +278,22 @@ private:
         if (ClosesP(nm) && HasOpen(L"p", true)) CloseInScope({L"p"}, {L"table", L"td", L"th", L"button"});
         if (nm == L"li") CloseInScope({L"li"}, {L"ul", L"ol", L"menu", L"table", L"td"});
         if (nm == L"dt" || nm == L"dd") CloseInScope({L"dt", L"dd"}, {L"dl", L"table"});
-        if (nm == L"tr") CloseInScope({L"tr"}, {L"table", L"tbody", L"thead", L"tfoot"});
+        if (nm == L"tr") {
+            CloseInScope({L"tr"}, {L"table", L"tbody", L"thead", L"tfoot"});
+            if (Cur()->name == L"table") {
+                std::unique_ptr<Node> tb(new Node());
+                tb->kind = Node::Elem;
+                tb->name = L"tbody";
+                Node* ptb = Append(std::move(tb));
+                if (ptb && stack_.size() < kMaxDepth) stack_.push_back(ptb);
+            }
+        }
         if (nm == L"td" || nm == L"th") CloseInScope({L"td", L"th"}, {L"tr", L"table"});
         if (nm == L"tbody" || nm == L"thead" || nm == L"tfoot") CloseInScope({L"tbody", L"thead", L"tfoot"}, {L"table"});
         if (nm == L"option") CloseInScope({L"option"}, {L"select", L"datalist"});
         if (nm == L"a") CloseInScope({L"a"}, {L"table", L"td"});
+        if (nm == L"button") CloseInScope({L"button"}, {L"table", L"td", L"form", L"div"});
+        if (In(nm, {L"h1", L"h2", L"h3", L"h4", L"h5", L"h6"})) CloseInScope({L"h1", L"h2", L"h3", L"h4", L"h5", L"h6"}, {L"table", L"td", L"th", L"div", L"section", L"article", L"aside", L"header", L"footer", L"main", L"nav", L"body"});
         if ((nm == L"html" || nm == L"body" || nm == L"head") && HasOpen(nm.c_str(), false)) return;
 
         std::unique_ptr<Node> node(new Node());
@@ -273,7 +317,10 @@ private:
         size_t pos = i_;
         while (true) {
             pos = s_.find(L"</", pos);
-            if (pos == std::wstring::npos) { std::wstring r = s_.substr(i_); i_ = n; return r; }
+            if (pos == std::wstring::npos) {
+                if (In(nm, {L"iframe", L"noembed", L"noframes", L"svg", L"math"})) return L"";
+                std::wstring r = s_.substr(i_); i_ = n; return r;
+            }
             size_t k = 0;
             while (k < nm.size() && pos + 2 + k < n && LowerC(s_[pos + 2 + k]) == nm[k]) k++;
             if (k == nm.size()) {
@@ -288,6 +335,12 @@ private:
         return r;
     }
 };
+
+// <template> icindeki (or. bildirimsel shadow DOM) <style> belge stiline karismaz
+static bool InTemplate(const Node* n) {
+    for (const Node* p = n->parent; p; p = p->parent) if (p->kind == Node::Elem && p->name == L"template") return true;
+    return false;
+}
 
 void PostProcess(Node* n, Document& doc) {
     // Iteratif gezinme (derin agaclarda yigin tasmasi olmasin)
@@ -314,7 +367,7 @@ void PostProcess(Node* n, Document& doc) {
                 doc.title = t;
             } else if (c->name == L"base" && doc.baseHref.empty()) {
                 if (auto* h = c->Attr(L"href")) doc.baseHref = *h;
-            } else if (c->name == L"style") {
+            } else if (c->name == L"style" && !InTemplate(c)) {
                 bool screen = true;
                 if (auto* m = c->Attr(L"media")) { std::wstring ml = ToLower(*m); if (ml.find(L"print") != std::wstring::npos && ml.find(L"screen") == std::wstring::npos) screen = false; }
                 if (screen && !c->kids.empty()) {
@@ -389,6 +442,7 @@ std::unique_ptr<Document> ParseHTML(const std::wstring& src) {
     Parser p(src, *doc);
     p.Run();
     PostProcess(doc->root.get(), *doc);
+    ApplyDeclarativeShadow(*doc, doc->root.get());
     return doc;
 }
 

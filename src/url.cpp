@@ -52,8 +52,27 @@ std::wstring EncodeUnsafe(const std::wstring& s) {
     return o;
 }
 
-std::wstring NormalizePath(const std::wstring& p) {
-    // p: "/a/./b/../c" (sorgu yok)
+bool ContainsEncodedNull(const std::wstring& s) {
+    if (s.find(L'\0') != std::wstring::npos) return true;
+    for (size_t i = 0; i + 2 < s.size(); i++) {
+        if (s[i] == L'%' && s[i + 1] == L'0' && s[i + 2] == L'0') return true;
+    }
+    return false;
+}
+
+std::wstring NormalizePath(const std::wstring& pIn) {
+    // pIn: "/a/./b/../c" (sorgu yok). %2e, %2f, %5c ve '\' dizin gecislerini onceden normallestir.
+    std::wstring p;
+    p.reserve(pIn.size());
+    for (size_t k = 0; k < pIn.size(); k++) {
+        if (pIn[k] == L'\\') { p += L'/'; continue; }
+        if (pIn[k] == L'%' && k + 2 < pIn.size()) {
+            wchar_t c1 = LowerC(pIn[k + 1]), c2 = LowerC(pIn[k + 2]);
+            if (c1 == L'2' && c2 == L'e') { p += L'.'; k += 2; continue; }
+            if ((c1 == L'2' && c2 == L'f') || (c1 == L'5' && c2 == L'c')) { p += L'/'; k += 2; continue; }
+        }
+        p += pIn[k];
+    }
     std::vector<std::wstring> segs;
     size_t i = 1;
     bool trailing = false;
@@ -62,9 +81,12 @@ std::wstring NormalizePath(const std::wstring& p) {
         if (j == std::wstring::npos) j = p.size();
         std::wstring seg = p.substr(i, j - i);
         bool last = (j == p.size());
-        if (seg == L"." || seg == L"%2e" || seg == L"%2E") { if (last) trailing = true; }
-        else if (seg == L".." || seg == L"%2e%2e" || seg == L"%2E%2E") { if (!segs.empty()) segs.pop_back(); if (last) trailing = true; }
-        else { segs.push_back(seg); trailing = false; }
+        if (seg == L".") { if (last) trailing = true; }
+        else if (seg == L"..") {
+            bool keepDriveRoot = (segs.size() == 1 && segs[0].size() == 2 && iswalpha(segs[0][0]) && segs[0][1] == L':');
+            if (!segs.empty() && !keepDriveRoot) segs.pop_back();
+            if (last) trailing = true;
+        } else { segs.push_back(seg); trailing = false; }
         i = j + 1;
     }
     std::wstring o;
@@ -88,6 +110,7 @@ bool HasScheme(const std::wstring& s, std::wstring* scheme) {
 
 std::wstring Url::Origin() const {
     if (scheme == L"about") return L"about:";
+    if (scheme == L"file") return L"file://";
     std::wstring o = scheme + L"://" + host;
     if (!((scheme == L"https" && port == 443) || (scheme == L"http" && port == 80)))
         o += L":" + std::to_wstring(port);
@@ -102,8 +125,10 @@ std::wstring Url::ToString() const {
 
 Url ParseUrl(const std::wstring& in) {
     Url u;
+    if (ContainsEncodedNull(in)) return u;
     std::wstring s;
     for (wchar_t c : Trim(in)) if (c != L'\t' && c != L'\n' && c != L'\r') s += c;
+    if (ContainsEncodedNull(s)) return u;
     std::wstring sch;
     if (!HasScheme(s, &sch)) return u;
     u.scheme = sch;
@@ -116,8 +141,25 @@ Url ParseUrl(const std::wstring& in) {
         u.ok = true;
         return u;
     }
+    if (sch == L"file") {
+        // Yerel dosya: file:///C:/klasor/sayfa.html  (yalnizca surucu harfli Windows yollari)
+        std::wstring rest = s.substr(p);
+        for (auto& c : rest) if (c == L'\\') c = L'/';
+        size_t h = rest.find(L'#');
+        if (h != std::wstring::npos) { u.fragment = rest.substr(h + 1); rest = rest.substr(0, h); }
+        std::wstring query;
+        size_t q = rest.find(L'?');
+        if (q != std::wstring::npos) { query = rest.substr(q); rest = rest.substr(0, q); }
+        size_t k = 0;
+        while (k < rest.size() && rest[k] == L'/') k++;
+        rest = rest.substr(k);
+        if (StartsWith(ToLower(rest), L"localhost/")) rest = rest.substr(10);
+        u.path = EncodeUnsafe(NormalizePath(L"/" + rest) + query);
+        u.ok = true;
+        return u;
+    }
     if (sch != L"http" && sch != L"https") {
-        // Diger semalar (javascript:, file:, data:, ...) motor tarafindan acilmaz.
+        // Diger semalar (javascript:, data:, ...) motor tarafindan acilmaz.
         u.path = s.substr(p);
         u.ok = true;
         return u;
@@ -191,14 +233,22 @@ std::wstring ResolveUrl(const std::wstring& baseStr, const std::wstring& relIn) 
     if (rel.size() >= 2 && (rel[0] == L'/' || rel[0] == L'\\') && (rel[1] == L'/' || rel[1] == L'\\'))
         return b.scheme + L":" + rel;
     if (rel[0] == L'#') return b.ToString() + rel;
-    if (rel[0] == L'/') return b.Origin() + rel;
     std::wstring pathOnly = b.path;
     size_t q = pathOnly.find(L'?');
     if (q != std::wstring::npos) pathOnly = pathOnly.substr(0, q);
     if (rel[0] == L'?') return b.Origin() + pathOnly + rel;
-    size_t slash = pathOnly.rfind(L'/');
-    std::wstring dir = slash == std::wstring::npos ? L"/" : pathOnly.substr(0, slash + 1);
-    return b.Origin() + dir + rel;
+    std::wstring combined;
+    if (rel[0] == L'/') {
+        combined = rel;
+    } else {
+        size_t slash = pathOnly.rfind(L'/');
+        std::wstring dir = slash == std::wstring::npos ? L"/" : pathOnly.substr(0, slash + 1);
+        combined = dir + rel;
+    }
+    size_t qh = combined.find_first_of(L"?#");
+    std::wstring pPart = (qh == std::wstring::npos) ? combined : combined.substr(0, qh);
+    std::wstring tail = (qh == std::wstring::npos) ? L"" : combined.substr(qh);
+    return b.Origin() + NormalizePath(pPart) + tail;
 }
 
 std::wstring UrlEncodeComponent(const std::wstring& s) {
@@ -212,6 +262,85 @@ std::wstring UrlEncodeComponent(const std::wstring& s) {
         else { o += L'%'; o += hex[c >> 4]; o += hex[c & 15]; }
     }
     return o;
+}
+
+bool IsSameOrigin(const Url& a, const Url& b) {
+    if (!a.ok || !b.ok) return false;
+    // Opaque origins (file:, about:, data:, vb.) hicbir zaman birbiriyle ayni koken kabul edilmez.
+    if (a.scheme != L"http" && a.scheme != L"https") return false;
+    return a.scheme == b.scheme && a.host == b.host && a.port == b.port;
+}
+
+bool IsPrivateOrLocalHost(const std::wstring& hostIn) {
+    std::wstring h = ToLower(Trim(hostIn));
+    while (!h.empty() && h.back() == L'.') h.pop_back();
+    if (h.empty()) return true;
+    if (h == L"localhost" || EndsWith(h, L".localhost") || h == L"local" || EndsWith(h, L".local")) return true;
+
+    // IPv6
+    if (h.front() == L'[' && h.back() == L']') {
+        std::wstring v6 = h.substr(1, h.size() - 2);
+        if (v6 == L"::1" || v6 == L"::" || v6 == L"0:0:0:0:0:0:0:1" || v6 == L"0:0:0:0:0:0:0:0") return true;
+        // Unique local (fc00::/7) ve Link-local (fe80::/10)
+        if (StartsWith(v6, L"fc") || StartsWith(v6, L"fd") ||
+            StartsWith(v6, L"fe8") || StartsWith(v6, L"fe9") || StartsWith(v6, L"fea") || StartsWith(v6, L"feb"))
+            return true;
+        if (StartsWith(v6, L"::ffff:")) {
+            std::wstring tail = v6.substr(7);
+            if (tail.find(L'.') != std::wstring::npos) return IsPrivateOrLocalHost(tail);
+            // Hex IPv4-mapped (orn. ::ffff:7f00:1) -> yerel kabul et
+            return true;
+        }
+        return false;
+    }
+
+    // Dordul onluk IPv4 ayristirma
+    int oct[4] = {0, 0, 0, 0};
+    int part = 0, digits = 0;
+    bool leadingZero = false;
+    bool allValidQuad = true;
+    for (size_t i = 0; i < h.size(); i++) {
+        wchar_t c = h[i];
+        if (c == L'.') {
+            if (digits == 0 || part >= 3) { allValidQuad = false; break; }
+            part++;
+            digits = 0;
+        } else if (c >= L'0' && c <= L'9') {
+            if (digits == 0 && c == L'0' && i + 1 < h.size() && h[i + 1] != L'.') leadingZero = true;
+            oct[part] = oct[part] * 10 + (c - L'0');
+            if (oct[part] > 255) { allValidQuad = false; break; }
+            digits++;
+        } else {
+            allValidQuad = false;
+            break;
+        }
+    }
+    if (allValidQuad && part == 3 && digits > 0 && !leadingZero) {
+        int a = oct[0], b = oct[1];
+        if (a == 0 || a == 10 || a == 127) return true;
+        if (a == 169 && b == 254) return true;
+        if (a == 172 && b >= 16 && b <= 31) return true;
+        if (a == 192 && b == 168) return true;
+        if (a == 100 && b >= 64 && b <= 127) return true;
+        if (a >= 224) return true;
+        return false;
+    }
+
+    // Standart disi sayisal/oktal/onaltilik IP gosterimleri (orn. 2130706433, 127.1, 0177.0.0.1, 0x7f.0.0.1):
+    // DNS TLD'leri asla tamamen rakam/hex olamaz; son etiket sayisalsa yerel/ozel kabul et.
+    size_t lastDot = h.rfind(L'.');
+    std::wstring lastLabel = (lastDot == std::wstring::npos) ? h : h.substr(lastDot + 1);
+    if (!lastLabel.empty()) {
+        bool numericOrHex = true;
+        for (wchar_t c : lastLabel) {
+            if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f') || c == L'x')) { numericOrHex = false; break; }
+        }
+        bool hasDigit = false;
+        for (wchar_t c : lastLabel) if (c >= L'0' && c <= L'9') { hasDigit = true; break; }
+        if (numericOrHex && hasDigit) return true;
+    }
+
+    return false;
 }
 
 } // namespace mer

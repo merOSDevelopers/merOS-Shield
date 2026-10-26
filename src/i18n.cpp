@@ -12,49 +12,56 @@ namespace {
 
 std::atomic<Language> g_currentLanguage{Language::English};
 
-// Dahili sayfa CSS stilleri
+// merOS Shield Özgün Koyu Tema (Cyber-Slate Dark) - Yeni Sekme ve Dahili Sayfa CSS Stilleri
 const wchar_t* kPageCss =
     L"<style>"
-    L"body{margin:0;background:#f8fafc;color:#0f172a;font-family:'Segoe UI',sans-serif}"
-    L".w{max-width:840px;margin:36px auto;padding:0 24px}"
-    L".brand{display:flex;align-items:center;gap:14px;margin:0 0 16px}"
-    L".brand-icon{width:44px;height:44px;background:#1e40af;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:22px;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets'}"
-    L".brand-text h1{font-size:30px;font-weight:700;margin:0;line-height:1.2;color:#0f172a}"
-    L".brand-pill{display:inline-block;font-size:11px;font-weight:700;color:#2563eb;background:#eff6ff;border:1px solid #bfdbfe;border-radius:10px;padding:1px 8px;margin-top:2px}"
-    L".alt{color:#475569;margin:0 0 20px;font-size:14px;line-height:1.5}"
-    L".ara{display:flex;gap:10px;margin:0 0 22px}"
-    L".ara input[name=q]{flex:1;height:44px;padding:0 16px;border:1px solid #cbd5e1;border-radius:10px;font-size:15px;background:#fff}"
-    L".ara input[type=submit]{height:44px;padding:0 22px;background:#2563eb;color:#fff;border:none;border-radius:10px;font-weight:600;font-size:14px;cursor:pointer}"
-    L".izgara{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:0 0 22px}"
-    L".card{display:flex;align-items:center;gap:12px;background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:12px 14px;text-decoration:none;color:inherit}"
-    L".card:hover{border-color:#93c5fd;background:#f8fafc;text-decoration:none}"
-    L".badge{width:38px;height:38px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff}"
-    L".badge-wiki{background:#202122;font-family:Georgia,serif;font-size:18px}"
-    L".badge-hn{background:#ff6600;font-family:Arial,sans-serif;font-size:16px}"
-    L".badge-cnn{background:#cc0000;font-size:11px;font-weight:800}"
-    L".badge-npr{background:#1e3a8a;font-size:12px;font-weight:700}"
-    L".badge-gh{background:#181717;font-size:13px;font-weight:700}"
-    L".badge-bbc{background:#991b1b;font-size:11px;font-weight:800}"
-    L".info{display:flex;flex-direction:column}"
-    L".title{font-size:14px;font-weight:600;color:#1e293b;line-height:1.3}"
-    L".host{font-size:12px;color:#64748b;margin-top:2px}"
-    L".k{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:20px 24px;margin:0 0 18px}"
-    L".k h3{margin:0 0 14px;font-size:16px;color:#1e293b;font-weight:700}"
-    L".sec-list{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:0;padding:0;list-style:none}"
-    L".sec-item{display:flex;align-items:flex-start;gap:8px;font-size:13px;color:#334155;line-height:1.45}"
-    L".ic{font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-size:15px;margin-top:2px}"
-    L".ic-lock{color:#16a34a}.ic-block{color:#dc2626}.ic-code{color:#ea580c}.ic-dl{color:#2563eb}"
-    L".kucuk{color:#64748b;font-size:13px;line-height:1.5;margin:0 0 12px}"
-    L".lang-bar{padding-top:12px;border-top:1px solid #e2e8f0;font-size:13px;color:#64748b}"
-    L".lang-bar a{font-weight:600;color:#2563eb;margin:0 4px;text-decoration:none}"
-    L"code{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:2px 6px;font-family:Consolas,monospace;font-size:13px}"
+    L"body{margin:0;background:#111621;color:#f1f5f9;font-family:'Segoe UI',sans-serif}"
+    L".w{max-width:820px;margin:0 auto;padding:34px 28px 24px}"
+    L".top-bar{display:flex;justify-content:space-between;align-items:center;margin:0 0 28px}"
+    L".brand{display:flex;align-items:center;gap:14px}"
+    L".brand-orb{width:48px;height:48px;border-radius:14px;background:linear-gradient(135deg,#0ea5e9,#2563eb,#10b981);display:flex;align-items:center;justify-content:center;color:#fff;font-size:24px;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';box-shadow:0 6px 20px rgba(14,165,233,0.28)}"
+    L".brand-title{font-size:24px;font-weight:700;color:#f8fafc;margin:0;line-height:1.15}"
+    L".brand-sub{font-size:12px;color:#38bdf8;font-weight:600;margin-top:2px}"
+    L".top-actions{display:flex;align-items:center;gap:8px;font-size:12px;color:#94a3b8;background:#182030;border:1px solid #263248;border-radius:18px;padding:6px 14px}"
+    L".top-actions a{color:#38bdf8;text-decoration:none;font-weight:600}"
+    L".search-wrap{max-width:580px;margin:0 auto 34px}"
+    L".ara{display:flex;align-items:center;gap:12px;background:#182030;border:1px solid #2b3954;border-radius:26px;padding:6px 18px;box-shadow:0 8px 24px rgba(0,0,0,0.34)}"
+    L".search-ic{width:28px;height:28px;border-radius:14px;background:linear-gradient(135deg,#0284c7,#2563eb);display:flex;align-items:center;justify-content:center;color:#fff;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-size:13px}"
+    L".ara input[name=q]{flex:1;height:38px;padding:0 6px;border:none;border-radius:18px;font-size:15px;background:#182030;color:#f8fafc}"
+    L".tiles{display:grid;grid-template-columns:repeat(6,1fr);gap:14px;max-width:680px;margin:0 auto 34px}"
+    L".tile{display:flex;flex-direction:column;align-items:center;text-decoration:none;color:#e2e8f0}"
+    L".tile-box{width:82px;height:82px;background:#182030;border:1px solid #263248;border-radius:16px;display:flex;align-items:center;justify-content:center;margin-bottom:8px;box-shadow:0 6px 16px rgba(0,0,0,0.25)}"
+    L".tile:hover .tile-box{background:#1f2a3f;border-color:#38bdf8}"
+    L".badge{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff}"
+    L".badge-yt{background:#e62117;color:#fff;font-size:17px}"
+    L".badge-wiki{background:#2d3748;font-family:Georgia,serif;font-size:20px}"
+    L".badge-gh{background:#0f172a;border:1px solid #334155;font-size:15px}"
+    L".badge-hn{background:#ff6600;font-family:Arial,sans-serif;font-size:18px}"
+    L".badge-cnn{background:#cc0000;font-size:12px;font-weight:800}"
+    L".badge-bbc{background:#991b1b;font-size:12px;font-weight:800}"
+    L".tile-lbl{font-size:12px;color:#cbd5e1;text-align:center}"
+    L".shield-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;max-width:680px;margin:0 auto 18px}"
+    L".scard{display:flex;align-items:flex-start;gap:12px;background:#161e2e;border:1px solid #243046;border-radius:14px;padding:14px 16px}"
+    L".sic{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-family:'Segoe Fluent Icons','Segoe MDL2 Assets';font-size:16px}"
+    L".sic-tls{background:#064e3b;color:#34d399}"
+    L".sic-ad{background:#1e3a8a;color:#60a5fa}"
+    L".sic-js{background:#3b0764;color:#c084fc}"
+    L".sic-dl{background:#0c4a6e;color:#38bdf8}"
+    L".stxt{flex:1}"
+    L".stitle{font-size:13px;font-weight:700;color:#f1f5f9;margin:0 0 3px}"
+    L".sdesc{font-size:12px;color:#94a3b8;line-height:1.4}"
+    L".k{background:#161e2e;border:1px solid #243046;border-radius:14px;padding:20px 24px;margin:0 0 18px}"
+    L".k h3{margin:0 0 14px;font-size:16px;color:#f8fafc;font-weight:700}"
+    L".alt{color:#94a3b8;margin:0 0 20px;font-size:14px;line-height:1.5}"
+    L"a{color:#38bdf8;text-decoration:none}"
+    L"code{background:#0f172a;border:1px solid #263248;border-radius:4px;padding:2px 6px;font-family:Consolas,monospace;font-size:13px;color:#e2e8f0}"
     L"</style>";
 
 // Metin Tablosu - İngilizce (Varsayılan)
 const wchar_t* const kStringsEn[] = {
     // UI & Durum çubuğu
     /* AppName */               L"merOS Shield",
-    /* SearchOrAddress */       L"Search or enter web address",
+    /* SearchOrAddress */       L"Search with DuckDuckGo or enter web address",
     /* NewTab */               L"New Tab",
     /* Loading */               L"Loading: ",
     /* LoadingImages */         L"Loading images (%d)   ",
@@ -72,14 +79,14 @@ const wchar_t* const kStringsEn[] = {
     // Dahili Sayfalar - Giriş (Home)
     /* HomeTitle */             L"New Tab",
     /* HomeTagline */           L"A fast, security-focused browser powered by custom engines <b>MerEngine</b> and <b>merJS</b>.",
-    /* HomeSearchPlaceholder */ L"Search with DuckDuckGo",
+    /* HomeSearchPlaceholder */ L"Search with DuckDuckGo or enter web address",
     /* HomeSearchButton */      L"Search",
     /* HomeSecurityTitle */     L"Security",
     /* HomeSecItem1 */          L"HTTPS only (TLS 1.2 / 1.3), certificate errors are never bypassed",
-    /* HomeSecItem2 */          L"Tracker and ad servers blocked, no third-party cookies, no Referer",
+    /* HomeSecItem2 */          L"Tracker and ad servers blocked, no third-party cookies, Referer trimmed to origin",
     /* HomeSecItem3 */          L"Sandboxed JavaScript: step, memory, and recursion limits, no popups",
     /* HomeSecItem4 */          L"No automatic downloads, mixed content blocked",
-    /* HomeShortcuts */         L"Shortcuts: Ctrl+L address, F5 reload, F12 console, Alt+\x2190/\x2192 back/forward, Ctrl +/- zoom. Engine info: <a href='about:engine'>about:engine</a>",
+    /* HomeShortcuts */         L"Shortcuts: Ctrl+L address, F5 reload, F12 console, Alt+\x2190/\x2192 back/forward, Ctrl+T new tab, Ctrl+W close, Ctrl+Tab switch, Ctrl+F find, Ctrl+U source, Ctrl +/- zoom. Engine info: <a href='about:engine'>about:engine</a>",
 
     // Dahili Sayfalar - Motor (Engine)
     /* EngineTitle */           L"MerEngine 0.2 + merJS 0.1",
@@ -127,7 +134,7 @@ const wchar_t* const kStringsEn[] = {
 const wchar_t* const kStringsTr[] = {
     // UI & Durum çubuğu
     /* AppName */               L"merOS Shield",
-    /* SearchOrAddress */       L"Adres yaz veya ara",
+    /* SearchOrAddress */       L"DuckDuckGo ile ara veya web adresi yaz",
     /* NewTab */               L"Yeni Sekme",
     /* Loading */               L"Y\u00FCkleniyor: ",
     /* LoadingImages */         L"Resimler y\u00FCkleniyor (%d)   ",
@@ -145,14 +152,14 @@ const wchar_t* const kStringsTr[] = {
     // Dahili Sayfalar - Giriş (Home)
     /* HomeTitle */             L"Yeni Sekme",
     /* HomeTagline */           L"Kendi motorumuz <b>MerEngine</b> ve JavaScript motorumuz <b>merJS</b> ile \u00E7al\u0131\u015Fan, g\u00FCvenlik ve h\u0131z odakl\u0131 taray\u0131c\u0131.",
-    /* HomeSearchPlaceholder */ L"DuckDuckGo ile ara",
+    /* HomeSearchPlaceholder */ L"DuckDuckGo ile ara veya web adresi yaz",
     /* HomeSearchButton */      L"Ara",
     /* HomeSecurityTitle */     L"G\u00FCvenlik",
     /* HomeSecItem1 */          L"Yaln\u0131zca HTTPS (TLS 1.2 / 1.3), sertifika hatalar\u0131 asla atlanmaz",
-    /* HomeSecItem2 */          L"\u0130zleyici ve reklam sunucular\u0131 engellenir, \u00FC\u00E7\u00FCnc\u00FC taraf \u00E7erez yok, Referer yok",
+    /* HomeSecItem2 */          L"\u0130zleyici ve reklam sunucular\u0131 engellenir, \u00FC\u00E7\u00FCnc\u00FC taraf \u00E7erez yok, Referer yaln\u0131zca k\u00F6ken",
     /* HomeSecItem3 */          L"JavaScript korumal\u0131 \u00E7al\u0131\u015F\u0131r: ad\u0131m, bellek ve \u00F6zyineleme s\u0131n\u0131rlar\u0131, a\u00E7\u0131l\u0131r pencere yok",
     /* HomeSecItem4 */          L"Otomatik indirme yok, kar\u0131\u015F\u0131k i\u00E7erik engelli",
-    /* HomeShortcuts */         L"K\u0131sayollar: Ctrl+L adres, F5 yenile, F12 konsol, Alt+\x2190/\x2192 geri/ileri, Ctrl +/- yak\u0131nla\u015Ft\u0131r. Motor bilgisi: <a href='about:motor'>about:motor</a>",
+    /* HomeShortcuts */         L"K\u0131sayollar: Ctrl+L adres, F5 yenile, F12 konsol, Alt+\x2190/\x2192 geri/ileri, Ctrl+T yeni sekme, Ctrl+W kapat, Ctrl+Tab sekme de\u011Fi\u015Ftir, Ctrl+F bul, Ctrl+U kaynak, Ctrl +/- yak\u0131nla\u015Ft\u0131r. Motor bilgisi: <a href='about:motor'>about:motor</a>",
 
     // Dahili Sayfalar - Motor (Engine)
     /* EngineTitle */           L"MerEngine 0.2 + merJS 0.1",
@@ -269,6 +276,12 @@ std::wstring NetErrorText(DWORD e) {
         return Get(StringId::NetErrUnrecognizedScheme, lang);
     case ERROR_WINHTTP_OPERATION_CANCELLED:
         return Get(StringId::NetErrOperationCancelled, lang);
+    case ERROR_FILE_NOT_FOUND:
+    case ERROR_PATH_NOT_FOUND:
+        return lang == Language::Turkish ? L"Dosya bulunamad\u0131. Ta\u015F\u0131nm\u0131\u015F, silinmi\u015F ya da ad\u0131 de\u011Fi\u015Fmi\u015F olabilir."
+                                         : L"File not found. It may have been moved, deleted or renamed.";
+    case ERROR_ACCESS_DENIED:
+        return lang == Language::Turkish ? L"Bu dosyay\u0131 okuma izni yok." : L"Access to this file was denied.";
     default: {
         wchar_t buf[128];
         const wchar_t* fmt = Get(StringId::NetErrGeneric, lang);
@@ -289,66 +302,59 @@ std::wstring GetHomePageHtml() {
     html += kPageCss;
     html += L"</head><body><div class=w>";
 
-    // Brand Header with native vector shield icon
+    // Ust Baslik: merOS Shield Ozgun Kalkan Kimligi + Motor/Dil Rozeti
+    html += L"<div class=top-bar>";
     html += L"<div class=brand>";
-    html += L"<div class=brand-icon>&#xEA18;</div>";
-    html += L"<div class=brand-text>";
-    html += L"<h1>merOS Shield</h1>";
-    html += L"<span class=brand-pill>SECURE BROWSER</span>";
+    html += L"<div class=brand-orb>&#xEA18;</div>";
+    html += L"<div><div class=brand-title>merOS Shield</div>";
+    html += L"<div class=brand-sub>MerEngine 0.2 &nbsp;&#x00B7;&nbsp; merJS Sandbox</div></div>";
+    html += L"</div>";
+    html += L"<div class=top-actions><a href='about:engine'>MerEngine</a> &nbsp;&#x00B7;&nbsp; ";
+    if (isEn) {
+        html += L"<b>EN</b> | <a href='about:lang?tr'>TR</a>";
+    } else {
+        html += L"<a href='about:lang?en'>EN</a> | <b>TR</b>";
+    }
     html += L"</div></div>";
 
-    html += L"<p class=alt>";
-    html += Get(StringId::HomeTagline, lang);
-    html += L"</p>";
-
-    // Search bar
+    // Ortalanmis Koyu Arama Kapsulu
+    html += L"<div class=search-wrap>";
     html += L"<form class=ara action='https://html.duckduckgo.com/html/' method=get>";
+    html += L"<div class=search-ic>&#xE721;</div>";
     html += L"<input name=q placeholder='";
     html += Get(StringId::HomeSearchPlaceholder, lang);
-    html += L"'><input type=submit value='";
-    html += Get(StringId::HomeSearchButton, lang);
-    html += L"'></form>";
+    html += L"'></form></div>";
 
-    // Speed Dial / Quick Access Cards with clean branded badges
-    html += L"<div class=izgara>";
+    // 6'li Hizli Erisim Kutucuklari
+    html += L"<div class=tiles>";
+    html += L"<a class=tile href='https://www.youtube.com/'><div class=tile-box><div class='badge badge-yt'>&#x25B6;</div></div><span class=tile-lbl>YouTube</span></a>";
     if (isEn) {
-        html += L"<a class=card href='https://en.wikipedia.org/'><div class='badge badge-wiki'>W</div><div class=info><span class=title>Wikipedia</span><span class=host>en.wikipedia.org</span></div></a>";
-        html += L"<a class=card href='https://news.ycombinator.com/'><div class='badge badge-hn'>Y</div><div class=info><span class=title>Hacker News</span><span class=host>news.ycombinator.com</span></div></a>";
-        html += L"<a class=card href='https://lite.cnn.com/'><div class='badge badge-cnn'>CNN</div><div class=info><span class=title>CNN Lite</span><span class=host>lite.cnn.com</span></div></a>";
-        html += L"<a class=card href='https://text.npr.org/'><div class='badge badge-npr'>npr</div><div class=info><span class=title>NPR Text</span><span class=host>text.npr.org</span></div></a>";
-        html += L"<a class=card href='https://github.com/'><div class='badge badge-gh'>GH</div><div class=info><span class=title>GitHub</span><span class=host>github.com</span></div></a>";
-        html += L"<a class=card href='https://www.bbc.com/news'><div class='badge badge-bbc'>BBC</div><div class=info><span class=title>BBC News</span><span class=host>bbc.com/news</span></div></a>";
+        html += L"<a class=tile href='https://en.wikipedia.org/'><div class=tile-box><div class='badge badge-wiki'>W</div></div><span class=tile-lbl>Wikipedia</span></a>";
     } else {
-        html += L"<a class=card href='https://tr.wikipedia.org/'><div class='badge badge-wiki'>W</div><div class=info><span class=title>Vikipedi</span><span class=host>tr.wikipedia.org</span></div></a>";
-        html += L"<a class=card href='https://news.ycombinator.com/'><div class='badge badge-hn'>Y</div><div class=info><span class=title>Hacker News</span><span class=host>news.ycombinator.com</span></div></a>";
-        html += L"<a class=card href='https://lite.cnn.com/'><div class='badge badge-cnn'>CNN</div><div class=info><span class=title>CNN Lite</span><span class=host>lite.cnn.com</span></div></a>";
-        html += L"<a class=card href='https://text.npr.org/'><div class='badge badge-npr'>npr</div><div class=info><span class=title>NPR Text</span><span class=host>text.npr.org</span></div></a>";
-        html += L"<a class=card href='https://github.com/'><div class='badge badge-gh'>GH</div><div class=info><span class=title>GitHub</span><span class=host>github.com</span></div></a>";
-        html += L"<a class=card href='https://www.bbc.com/turkce'><div class='badge badge-bbc'>BBC</div><div class=info><span class=title>BBC T\u00FCrk\u00E7e</span><span class=host>bbc.com/turkce</span></div></a>";
+        html += L"<a class=tile href='https://tr.wikipedia.org/'><div class=tile-box><div class='badge badge-wiki'>W</div></div><span class=tile-lbl>Vikipedi</span></a>";
+    }
+    html += L"<a class=tile href='https://github.com/'><div class=tile-box><div class='badge badge-gh'>GH</div></div><span class=tile-lbl>GitHub</span></a>";
+    html += L"<a class=tile href='https://news.ycombinator.com/'><div class=tile-box><div class='badge badge-hn'>Y</div></div><span class=tile-lbl>Hacker News</span></a>";
+    html += L"<a class=tile href='https://lite.cnn.com/'><div class=tile-box><div class='badge badge-cnn'>CNN</div></div><span class=tile-lbl>CNN Lite</span></a>";
+    if (isEn) {
+        html += L"<a class=tile href='https://www.bbc.com/news'><div class=tile-box><div class='badge badge-bbc'>BBC</div></div><span class=tile-lbl>BBC News</span></a>";
+    } else {
+        html += L"<a class=tile href='https://www.bbc.com/turkce'><div class=tile-box><div class='badge badge-bbc'>BBC</div></div><span class=tile-lbl>BBC T\u00FCrk\u00E7e</span></a>";
     }
     html += L"</div>";
 
-    // Security Box with vector icons
-    html += L"<div class=k><h3><span class='ic ic-lock'>&#xE72E;</span> ";
-    html += Get(StringId::HomeSecurityTitle, lang);
-    html += L"</h3><ul class=sec-list>";
-    html += L"<li class=sec-item><span class='ic ic-lock'>&#xE72E;</span><div>"; html += Get(StringId::HomeSecItem1, lang); html += L"</div></li>";
-    html += L"<li class=sec-item><span class='ic ic-block'>&#xE71A;</span><div>"; html += Get(StringId::HomeSecItem2, lang); html += L"</div></li>";
-    html += L"<li class=sec-item><span class='ic ic-code'>&#xE943;</span><div>"; html += Get(StringId::HomeSecItem3, lang); html += L"</div></li>";
-    html += L"<li class=sec-item><span class='ic ic-dl'>&#xE896;</span><div>"; html += Get(StringId::HomeSecItem4, lang); html += L"</div></li>";
-    html += L"</ul></div>";
-
-    // Shortcuts
-    html += L"<p class=kucuk><span class=ic>&#xE765;</span> ";
-    html += Get(StringId::HomeShortcuts, lang);
-    html += L"</p>";
-
-    // Language switcher
-    html += L"<div class='lang-bar'><span class=ic>&#xE774;</span> Language / Dil: ";
+    // merOS Shield Aktif Guvenlik & Motor Kalkanlari (2x2 Kompakt Grid)
+    html += L"<div class=shield-grid>";
     if (isEn) {
-        html += L"<b>English (Default)</b> | <a href='about:lang?tr'>T\u00FCrk\u00E7e</a>";
+        html += L"<div class=scard><div class='sic sic-tls'>&#xE72E;</div><div class=stxt><div class=stitle>Strict HTTPS (TLS 1.3)</div><div class=sdesc>Certificate errors are never bypassed; insecure traffic is blocked.</div></div></div>";
+        html += L"<div class=scard><div class='sic sic-ad'>&#xE71A;</div><div class=stxt><div class=stitle>Tracker &amp; Ad Shield</div><div class=sdesc>Ad servers blocked, zero third-party cookies, origin-only Referer.</div></div></div>";
+        html += L"<div class=scard><div class='sic sic-js'>&#xE943;</div><div class=stxt><div class=stitle>Sandboxed merJS Engine</div><div class=sdesc>Isolated per-tab execution with strict step, memory &amp; recursion limits.</div></div></div>";
+        html += L"<div class=scard><div class='sic sic-dl'>&#xEA18;</div><div class=stxt><div class=stitle>Zero Auto-Download</div><div class=sdesc>Mixed content and unsolicited binary downloads are blocked by default.</div></div></div>";
     } else {
-        html += L"<a href='about:lang?en'>English</a> | <b>T\u00FCrk\u00E7e</b>";
+        html += L"<div class=scard><div class='sic sic-tls'>&#xE72E;</div><div class=stxt><div class=stitle>Zorunlu HTTPS (TLS 1.3)</div><div class=sdesc>Sertifika hatalar\u0131 asla atlanmaz; g\u00FCvensiz a\u011F trafi\u011Fi engellenir.</div></div></div>";
+        html += L"<div class=scard><div class='sic sic-ad'>&#xE71A;</div><div class=stxt><div class=stitle>\u0130zleyici ve Reklam Kalkan\u0131</div><div class=sdesc>Takip\u00E7i sunucular\u0131 ve 3. taraf \u00E7erezler engellenir, Referer k\u0131rp\u0131l\u0131r.</div></div></div>";
+        html += L"<div class=scard><div class='sic sic-js'>&#xE943;</div><div class=stxt><div class=stitle>Korumal\u0131 merJS Motoru</div><div class=sdesc>Her sekme kendi i\u015Flem hatt\u0131nda bellek ve ad\u0131m s\u0131n\u0131rlar\u0131yla izole \u00E7al\u0131\u015F\u0131r.</div></div></div>";
+        html += L"<div class=scard><div class='sic sic-dl'>&#xEA18;</div><div class=stxt><div class=stitle>Otomatik \u0130ndirme Korumas\u0131</div><div class=sdesc>Kar\u0131\u015F\u0131k i\u00E7erik ve izinsiz dosya indirmeleri varsay\u0131lan olarak kapal\u0131d\u0131r.</div></div></div>";
     }
     html += L"</div>";
 
@@ -387,6 +393,10 @@ std::wstring GetEnginePageHtml() {
     html += L"<script>document.getElementById('jt').textContent = '";
     html += Get(StringId::EngineTestOk, lang);
     html += L"' + [1,2,3].map(x => x * x).join(' \x00B7 ') + '  \x00B7  ' + new Date().toLocaleDateString();</script></div>";
+
+    html += L"<p class=alt><a href='about:home'>&#x2190; ";
+    html += (lang == Language::English) ? L"Back to New Tab" : L"Yeni Sekmeye D\u00F6n";
+    html += L"</a></p>";
 
     html += L"</div></body></html>";
     return html;

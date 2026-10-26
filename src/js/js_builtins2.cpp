@@ -82,6 +82,102 @@ static std::wstring ExpandUnicodeProperty(const std::wstring& prop, bool negate)
     return L"[" + body + L"]";
 }
 
+// ---- 'u' kipinde astral (U+10000 ustu) karakter sinifi ----
+// std::wregex 16 bitlik birimlerle calisir (Windows). [\u{1D400}-\u{1D7FF}] gibi siniflar vekil cift
+// (surrogate pair) alternatiflerine cevrilir: (?:[bmp]|\uD835[\uDC00-\uDFFF]|...)  (regexpu yontemi)
+static std::wstring U16Esc(uint32_t c) { wchar_t b[16]; swprintf(b, 16, L"\\u%04X", unsigned(c)); return b; }
+static std::wstring AstralAlt(uint32_t lo, uint32_t hi) {
+    auto H = [](uint32_t c) { return 0xD800 + ((c - 0x10000) >> 10); };
+    auto L = [](uint32_t c) { return 0xDC00 + ((c - 0x10000) & 0x3FF); };
+    std::wstring o;
+    uint32_t hl = H(lo), hh = H(hi);
+    if (hl == hh) return U16Esc(hl) + L"[" + U16Esc(L(lo)) + L"-" + U16Esc(L(hi)) + L"]";
+    o = U16Esc(hl) + L"[" + U16Esc(L(lo)) + L"-\\uDFFF]";
+    if (hh > hl + 1) o += L"|[" + U16Esc(hl + 1) + L"-" + U16Esc(hh - 1) + L"][\\uDC00-\\uDFFF]";
+    o += L"|" + U16Esc(hh) + L"[\\uDC00-" + U16Esc(L(hi)) + L"]";
+    return o;
+}
+// i '[' uzerinde. Sinif astral icermiyorsa false (normal yol devam eder).
+static bool TranslateAstralClass(const std::wstring& src, size_t& i, std::wstring& out) {
+    size_t j = i + 1;
+    bool neg = j < src.size() && src[j] == L'^';
+    if (neg) j++;
+    std::vector<std::pair<uint32_t, uint32_t>> bmp, astral;
+    std::wstring escs;   // \d \w \s gibi kacislar aynen
+    bool any = false;
+    auto atom = [&](size_t& k, uint32_t& cp, std::wstring& esc) -> bool {
+        if (k >= src.size()) return false;
+        wchar_t c = src[k];
+        if (c == L'\\' && k + 1 < src.size()) {
+            wchar_t n = src[k + 1];
+            if (n == L'u' && k + 2 < src.size() && src[k + 2] == L'{') {
+                size_t e = src.find(L'}', k + 3);
+                if (e == std::wstring::npos) return false;
+                cp = uint32_t(wcstoul(src.substr(k + 3, e - k - 3).c_str(), nullptr, 16));
+                k = e + 1;
+                return true;
+            }
+            if (n == L'u' && k + 5 < src.size()) {
+                cp = uint32_t(wcstoul(src.substr(k + 2, 4).c_str(), nullptr, 16));
+                k += 6;
+                if (cp >= 0xD800 && cp <= 0xDBFF && k + 5 < src.size() && src[k] == L'\\' && src[k + 1] == L'u') {
+                    uint32_t lo = uint32_t(wcstoul(src.substr(k + 2, 4).c_str(), nullptr, 16));
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); k += 6; }
+                }
+                return true;
+            }
+            if (n == L'x' && k + 3 < src.size()) { cp = uint32_t(wcstoul(src.substr(k + 2, 2).c_str(), nullptr, 16)); k += 4; return true; }
+            if (wcschr(L"dDwWsS", n)) { esc = src.substr(k, 2); k += 2; return true; }
+            static const wchar_t* ctl = L"n\nr\rt\tv\vf\f0\0";
+            for (const wchar_t* q = ctl; *q; q += 2) if (n == q[0]) { cp = q[1]; k += 2; return true; }
+            cp = n;
+            k += 2;
+            return true;
+        }
+        if (c >= 0xD800 && c <= 0xDBFF && k + 1 < src.size() && src[k + 1] >= 0xDC00 && src[k + 1] <= 0xDFFF) {
+            cp = 0x10000 + ((uint32_t(c) - 0xD800) << 10) + (uint32_t(src[k + 1]) - 0xDC00);
+            k += 2;
+            return true;
+        }
+        cp = c;
+        k++;
+        return true;
+    };
+    bool first = true;
+    while (j < src.size() && (src[j] != L']' || (first && false))) {
+        first = false;
+        uint32_t a = 0, b = 0;
+        std::wstring e1, e2;
+        if (!atom(j, a, e1)) return false;
+        if (!e1.empty()) { escs += e1; continue; }
+        b = a;
+        if (j + 1 < src.size() && src[j] == L'-' && src[j + 1] != L']') {
+            size_t k = j + 1;
+            if (!atom(k, b, e2) || !e2.empty()) { escs += L"\\-"; j++; b = a; }
+            else j = k;
+        }
+        if (b < a) return false;
+        if (b > 0xFFFF) any = true;
+        if (a <= 0xFFFF) bmp.emplace_back(a, std::min<uint32_t>(b, 0xFFFF));
+        if (b > 0xFFFF) astral.emplace_back(std::max<uint32_t>(a, 0x10000), b);
+    }
+    if (!any || j >= src.size()) return false;
+    std::wstring bmpCls;
+    for (auto& r : bmp) bmpCls += r.first == r.second ? U16Esc(r.first) : U16Esc(r.first) + L"-" + U16Esc(r.second);
+    bmpCls += escs;
+    std::wstring alts;
+    for (auto& r : astral) { if (!alts.empty()) alts += L"|"; alts += AstralAlt(r.first, r.second); }
+    if (!neg) {
+        out += L"(?:";
+        if (!bmpCls.empty()) out += L"[" + bmpCls + L"]|";
+        out += alts + L")";
+    } else {
+        out += L"(?:(?!" + alts + L")(?:[\\uD800-\\uDBFF][\\uDC00-\\uDFFF]|" + (bmpCls.empty() ? std::wstring(L"[\\s\\S]") : L"[^" + bmpCls + L"]") + L"))";
+    }
+    i = j;   // ']' uzerinde
+    return true;
+}
+
 std::shared_ptr<Compiled> CompileRegex(Runtime& rt, const std::wstring& src, const std::wstring& flags) {
     static thread_local std::list<std::pair<std::wstring, std::shared_ptr<Compiled>>> cache;
     std::wstring key = flags + L"/" + src;
@@ -100,6 +196,7 @@ std::shared_ptr<Compiled> CompileRegex(Runtime& rt, const std::wstring& src, con
     std::vector<std::wstring> names{L""};
     std::wstring out;
     bool inClass = false;
+    bool lastClassEsc = false;   // sinif icinde son oge \d \w \s gibi bir sinif kacisiydi
     for (size_t i = 0; i < src.size(); i++) {
         wchar_t ch = src[i];
         if (ch == L'\\' && i + 1 < src.size()) {
@@ -153,18 +250,47 @@ std::shared_ptr<Compiled> CompileRegex(Runtime& rt, const std::wstring& src, con
                 continue;
             }
             if (n == L'/') { out += L'/'; i++; continue; }
-            if (n == L'd' && inClass) { out += L"0-9"; i++; continue; }
+            // Noktalama kacislari (\- \. \] \$ ...) ve sinif icindeki \b (geri silme): her ECMAScript motorunun
+            // ayni okudugu \uXXXX bicimine cevrilir (MSVC std::regex bazi kimlik kacislarini reddeder)
+            if (n < 0x80 && !iswalnum(n) && n != L'_') { out += U16Esc(n); i++; lastClassEsc = false; continue; }
+            if (n == L'b' && inClass) { out += U16Esc(8); i++; lastClassEsc = false; continue; }
+            bool classEsc = n == L'd' || n == L'D' || n == L'w' || n == L'W' || n == L's' || n == L'S';
+            // \w \d \s JS'te sabit tanimlidir (\w yalnizca ASCII); std::wregex yerel ayara bakar -> acik kume
+            static const wchar_t* kWs = L"\\t\\n\\v\\f\\r \\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF";
+            if (inClass && (n == L'd' || n == L'w' || n == L's')) {
+                out += n == L'd' ? L"0-9" : n == L'w' ? L"A-Za-z0-9_" : kWs;
+                i++;
+                lastClassEsc = true;
+                continue;
+            }
+            if (!inClass && classEsc) {
+                std::wstring set = (n == L'd' || n == L'D') ? L"0-9" : (n == L'w' || n == L'W') ? L"A-Za-z0-9_" : kWs;
+                out += (n == L'd' || n == L'w' || n == L's') ? L"[" + set + L"]" : L"[^" + set + L"]";
+                i++;
+                continue;
+            }
             out += ch;
             out += n;
             i++;
+            lastClassEsc = inClass && classEsc;
             continue;
         }
         if (inClass) {
             if (ch == L']') inClass = false;
+            // JS: sinif icindeki '[' duz karakterdir; std::regex "[." / "[:" / "[=" dizilerini POSIX olarak yorumlar
+            if (ch == L'[') { out += U16Esc(L'['); lastClassEsc = false; continue; }
+            // Annex B: sinif kacisinin ([\w-\d]) yanindaki '-' aralik degil duz karakterdir
+            if (ch == L'-' && (lastClassEsc || (i + 2 < src.size() && src[i + 1] == L'\\' && wcschr(L"dDwWsS", src[i + 2]) && src[i + 2]))) {
+                out += U16Esc(L'-');
+                lastClassEsc = false;
+                continue;
+            }
+            lastClassEsc = false;
             out += ch;
             continue;
         }
         if (ch == L'[') {
+            if (unicode && sizeof(wchar_t) == 2 && TranslateAstralClass(src, i, out)) continue;
             if (i + 2 < src.size() && src[i + 1] == L'^' && src[i + 2] == L']') { out += L"[\\s\\S]"; i += 2; continue; }
             if (i + 1 < src.size() && src[i + 1] == L']') { out += L"(?!)"; i += 1; continue; }
             inClass = true;
@@ -186,6 +312,19 @@ std::shared_ptr<Compiled> CompileRegex(Runtime& rt, const std::wstring& src, con
         }
         if (ch == L'(') names.push_back(L"");
         if (ch == L'.' && dotAll) { out += L"[\\s\\S]"; continue; }
+        // Annex B: niceleyici olmayan '{' ve tek '}' duz karakterdir (std::regex bunlari reddeder)
+        if (ch == L'{') {
+            size_t j = i + 1;
+            bool digits = false;
+            while (j < src.size() && iswdigit(src[j])) { j++; digits = true; }
+            if (digits && j < src.size() && src[j] == L',') { j++; while (j < src.size() && iswdigit(src[j])) j++; }
+            if (digits && j < src.size() && src[j] == L'}' && !out.empty()) { out += src.substr(i, j - i + 1); i = j; continue; }
+            out += U16Esc(L'{');
+            continue;
+        }
+        if (ch == L'}') { out += U16Esc(L'}'); continue; }
+        // Annex B: sinif disindaki ']' duz karakterdir (MSVC std::regex reddeder: Polymer'in /(?:]]|}})/ ifadesi)
+        if (ch == L']') { out += U16Esc(L']'); continue; }
         out += ch;
     }
     auto fl = std::regex_constants::ECMAScript;
@@ -211,7 +350,8 @@ Obj* ThisRe(Runtime& rt, const Value& v) {
 Compiled& Comp(Obj* re) { return *static_cast<Compiled*>(re->x->re.get()); }
 
 // Tek eslesme: basariyla esleserse dizi, yoksa null
-Value RegExec(Runtime& rt, Obj* re, const std::wstring& s) {
+// inputCache: ayni girdiyle tekrarlanan cagrilarda 'input' ozelligi icin paylasilan kopya (O(n^2) kopyalamayi onler)
+Value RegExec(Runtime& rt, Obj* re, const std::wstring& s, Str* inputCache = nullptr) {
     const std::wstring& fl = re->x->flags;
     bool global = fl.find(L'g') != std::wstring::npos, sticky = fl.find(L'y') != std::wstring::npos;
     if (s.size() > kMaxRegexInput) rt.Throw(L"RangeError", L"merJS: regex girdisi çok uzun");
@@ -239,7 +379,8 @@ Value RegExec(Runtime& rt, Obj* re, const std::wstring& s) {
     Obj* arr = rt.NewArray(0);
     for (size_t g = 0; g < m.size(); g++) arr->elems.push_back(m[g].matched ? Value::S(m[g].str()) : Value());
     rt.DefineData(arr, L"index", Value::N(index));
-    rt.DefineData(arr, L"input", Value::S(s));
+    if (inputCache) { if (!*inputCache) *inputCache = std::make_shared<std::wstring>(s); rt.DefineData(arr, L"input", Value::S(*inputCache)); }
+    else rt.DefineData(arr, L"input", Value::S(s));
     bool anyName = false;
     for (auto& n : c.names) if (!n.empty()) anyName = true;
     if (anyName) {
@@ -265,8 +406,8 @@ NATIVE(RegExp_ctor) {
     }
     return Value::O(rt.NewRegExp(src, flags));
 }
-NATIVE(RegExpP_exec) { UNUSED; return RegExec(rt, ThisRe(rt, thisV), rt.ToStr(A(0))); }
-NATIVE(RegExpP_test) { UNUSED; return Value::B(!RegExec(rt, ThisRe(rt, thisV), rt.ToStr(A(0))).IsNullish()); }
+NATIVE(RegExpP_exec) { UNUSED; Obj* re = ThisRe(rt, thisV); Str sp = rt.ToStrS(A(0)); return RegExec(rt, re, *sp, &sp); }
+NATIVE(RegExpP_test) { UNUSED; Obj* re = ThisRe(rt, thisV); Str sp = rt.ToStrS(A(0)); return Value::B(!RegExec(rt, re, *sp, &sp).IsNullish()); }
 NATIVE(RegExpP_toString) { UNUSED; Obj* r = ThisRe(rt, thisV); return Value::S(L"/" + r->x->str + L"/" + r->x->flags); }
 NATIVE(RegExpP_source) { UNUSED; if (!thisV.IsObj() || thisV.o->cls != Cls::RegExp) return Value::S(L"(?:)"); return Value::S(thisV.o->x->str); }
 NATIVE(RegExpP_flags) { UNUSED; if (!thisV.IsObj() || thisV.o->cls != Cls::RegExp) return Value::S(L""); return Value::S(thisV.o->x->flags); }
@@ -294,6 +435,7 @@ void AdvanceEmpty(Runtime& rt, Obj* re, const Value& m, const std::wstring& s) {
 }
 
 NATIVE(StringP_match) {
+    Str rxIn_;   // regex eslesmelerinin ortak input dizgesi
     UNUSED;
     std::wstring s = StrThis(rt, thisV);
     Obj* re = IsRe(A(0)) ? A(0).o : rt.NewRegExp(A(0).IsUndef() ? L"(?:)" : rt.ToStr(A(0)), L"");
@@ -301,7 +443,7 @@ NATIVE(StringP_match) {
     rt.Put(Value::O(re), L"lastIndex", Value::N(0));
     std::vector<Value> all;
     while (all.size() < 10000000) {
-        Value m = RegExec(rt, re, s);
+        Value m = RegExec(rt, re, s, &rxIn_);
         if (m.IsNullish()) break;
         all.push_back(rt.GetV(m, Value::N(0)));
         AdvanceEmpty(rt, re, m, s);
@@ -310,6 +452,7 @@ NATIVE(StringP_match) {
     return Value::O(rt.NewArrayFrom(all));
 }
 NATIVE(StringP_matchAll) {
+    Str rxIn_;   // regex eslesmelerinin ortak input dizgesi
     UNUSED;
     std::wstring s = StrThis(rt, thisV);
     Obj* re = nullptr;
@@ -319,7 +462,7 @@ NATIVE(StringP_matchAll) {
     } else re = rt.NewRegExp(rt.ToStr(A(0)), L"g");
     std::vector<Value> all;
     while (all.size() < 10000000) {
-        Value m = RegExec(rt, re, s);
+        Value m = RegExec(rt, re, s, &rxIn_);
         if (m.IsNullish()) break;
         all.push_back(m);
         AdvanceEmpty(rt, re, m, s);
@@ -330,7 +473,7 @@ NATIVE(StringP_search) {
     UNUSED;
     std::wstring s = StrThis(rt, thisV);
     Obj* re = IsRe(A(0)) ? rt.NewRegExp(A(0).o->x->str, L"") : rt.NewRegExp(rt.ToStr(A(0)), L"");
-    Value m = RegExec(rt, re, s);
+    Str rxIn_; Value m = RegExec(rt, re, s, &rxIn_);
     return m.IsNullish() ? Value::N(-1) : rt.Get(m, L"index");
 }
 
@@ -368,6 +511,7 @@ std::wstring ExpandReplacement(Runtime& rt, const std::wstring& rep, const std::
 }
 
 Value DoReplace(Runtime& rt, const Value& thisV, std::vector<Value>& args, bool all) {
+    Str rxIn_;   // regex eslesmelerinin ortak input dizgesi
     std::wstring s = StrThis(rt, thisV);
     Value pat = A(0), rep = A(1);
     bool fn = IsCallable(rep);
@@ -381,7 +525,7 @@ Value DoReplace(Runtime& rt, const Value& thisV, std::vector<Value>& args, bool 
         size_t last = 0;
         int guard = 0;
         while (guard++ < 10000000) {
-            Value m = RegExec(rt, re, s);
+            Value m = RegExec(rt, re, s, &rxIn_);
             if (m.IsNullish()) break;
             size_t pos = size_t(rt.ToNum(rt.Get(m, L"index")));
             std::wstring matched = rt.ToStr(rt.GetV(m, Value::N(0)));
@@ -429,6 +573,7 @@ NATIVE(StringP_replace) { UNUSED; return DoReplace(rt, thisV, args, false); }
 NATIVE(StringP_replaceAll) { UNUSED; return DoReplace(rt, thisV, args, true); }
 
 NATIVE(StringP_split) {
+    Str rxIn_;   // regex eslesmelerinin ortak input dizgesi
     UNUSED;
     std::wstring s = StrThis(rt, thisV);
     double lim = A(1).IsUndef() ? 4294967295.0 : double(uint32_t(int64_t(rt.ToNum(A(1)))));
@@ -438,14 +583,14 @@ NATIVE(StringP_split) {
     if (IsRe(A(0))) {
         Obj* re = rt.NewRegExp(A(0).o->x->str, A(0).o->x->flags + (HasG(A(0).o) ? L"" : L"g"));
         if (s.empty()) {
-            Value m = RegExec(rt, re, s);
+            Value m = RegExec(rt, re, s, &rxIn_);
             if (m.IsNullish()) out.push_back(Value::S(s));
             return Value::O(rt.NewArrayFrom(out));
         }
         size_t last = 0;
         rt.Put(Value::O(re), L"lastIndex", Value::N(0));
         while (out.size() < lim) {
-            Value m = RegExec(rt, re, s);
+            Value m = RegExec(rt, re, s, &rxIn_);
             if (m.IsNullish()) break;
             size_t pos = size_t(rt.ToNum(rt.Get(m, L"index")));
             std::wstring matched = rt.ToStr(rt.GetV(m, Value::N(0)));
@@ -1258,6 +1403,25 @@ NATIVE(DataViewP_setFloat32) {
     }
     return Value();
 }
+uint64_t DvRead64(uint8_t* p, bool le) {
+    uint64_t u = 0;
+    if (le) for (int i = 0; i < 8; i++) u |= uint64_t(p[i]) << (i * 8);
+    else for (int i = 0; i < 8; i++) u = (u << 8) | uint64_t(p[i]);
+    return u;
+}
+void DvWrite64(uint8_t* p, uint64_t u, bool le) {
+    if (le) for (int i = 0; i < 8; i++) p[i] = uint8_t(u >> (i * 8));
+    else for (int i = 0; i < 8; i++) p[7 - i] = uint8_t(u >> (i * 8));
+}
+NATIVE(DataViewP_getBigInt64) { UNUSED; uint8_t* p = GetDataViewPtr(rt, thisV, A(0), 8); return BigFromI64(int64_t(DvRead64(p, rt.Truthy(A(1))))); }
+NATIVE(DataViewP_getBigUint64) { UNUSED; uint8_t* p = GetDataViewPtr(rt, thisV, A(0), 8); return BigFromU64(DvRead64(p, rt.Truthy(A(1)))); }
+NATIVE(DataViewP_setBigInt64) {
+    UNUSED;
+    uint64_t u = BigToU64Wrap(rt, A(1));
+    uint8_t* p = GetDataViewPtr(rt, thisV, A(0), 8);
+    DvWrite64(p, u, rt.Truthy(A(2)));
+    return Value();
+}
 NATIVE(DataViewP_getFloat64) {
     UNUSED;
     uint8_t* p = GetDataViewPtr(rt, thisV, A(0), 8);
@@ -1362,6 +1526,8 @@ DEF_TYPED_CTOR(Int32Array, TypedKind::Int32)
 DEF_TYPED_CTOR(Uint32Array, TypedKind::Uint32)
 DEF_TYPED_CTOR(Float32Array, TypedKind::Float32)
 DEF_TYPED_CTOR(Float64Array, TypedKind::Float64)
+DEF_TYPED_CTOR(BigInt64Array, TypedKind::BigInt64)
+DEF_TYPED_CTOR(BigUint64Array, TypedKind::BigUint64)
 
 NATIVE(TypedArrayP_buffer) {
     UNUSED;
@@ -1774,6 +1940,10 @@ static void InstallTypedArrays(Runtime& rt) {
     M(rt.dataViewProto, L"getFloat32", DataViewP_getFloat32, 1);
     M(rt.dataViewProto, L"setFloat32", DataViewP_setFloat32, 2);
     M(rt.dataViewProto, L"getFloat64", DataViewP_getFloat64, 1);
+    M(rt.dataViewProto, L"getBigInt64", DataViewP_getBigInt64, 1);
+    M(rt.dataViewProto, L"getBigUint64", DataViewP_getBigUint64, 1);
+    M(rt.dataViewProto, L"setBigInt64", DataViewP_setBigInt64, 2);
+    M(rt.dataViewProto, L"setBigUint64", DataViewP_setBigInt64, 2);
     M(rt.dataViewProto, L"setFloat64", DataViewP_setFloat64, 2);
     rt.DefineData(rt.dataViewProto, L"\x01Symbol.toStringTag", Value::S(L"DataView"), false);
     Ctor(L"DataView", DataView_ctor, 1, rt.dataViewProto);
@@ -1820,6 +1990,8 @@ static void InstallTypedArrays(Runtime& rt) {
         {L"Uint32Array", Uint32Array_ctor, TypedKind::Uint32},
         {L"Float32Array", Float32Array_ctor, TypedKind::Float32},
         {L"Float64Array", Float64Array_ctor, TypedKind::Float64},
+        {L"BigInt64Array", BigInt64Array_ctor, TypedKind::BigInt64},
+        {L"BigUint64Array", BigUint64Array_ctor, TypedKind::BigUint64},
     };
 
     for (auto& td : types) {
@@ -1978,8 +2150,20 @@ NATIVE(TextDecoderP_ignoreBOM) {
 }
 NATIVE(TextDecoderP_decode) {
     UNUSED;
+    bool stream = A(1).IsObj() && rt.Truthy(rt.Get(A(1), L"stream"));
+    // akis kipi: onceki cagrida yarim kalan UTF-8 dizisi (en fazla 3 bayt)
+    std::vector<uint8_t> pend;
+    {
+        Value pv = rt.Get(thisV, L"\x02td_pend");
+        if (pv.IsStr()) for (wchar_t c : *pv.s) pend.push_back(uint8_t(c));
+    }
+    bool started = rt.Truthy(rt.Get(thisV, L"\x02td_started"));
     if (args.empty() || A(0).IsUndef()) {
-        return Value::S(L"");
+        if (thisV.IsObj()) { rt.DefineData(thisV.o, L"\x02td_pend", Value::S(L""), false); rt.DefineData(thisV.o, L"\x02td_started", Value::B(stream && started), false); }
+        if (pend.empty()) return Value::S(L"");
+        bool fatal0 = rt.Truthy(rt.Get(thisV, L"\x02td_fatal"));
+        if (fatal0) rt.Throw(L"TypeError", L"The encoded data was not valid utf-8");
+        return Value::S(std::wstring(1, wchar_t(0xFFFD)));
     }
     const uint8_t* ptr = nullptr;
     size_t len = 0;
@@ -1995,8 +2179,36 @@ NATIVE(TextDecoderP_decode) {
     }
 
     bool fatal = rt.Truthy(rt.Get(thisV, L"\x02td_fatal"));
-    bool ignoreBOM = rt.Truthy(rt.Get(thisV, L"\x02td_ignoreBOM"));
+    bool ignoreBOM = rt.Truthy(rt.Get(thisV, L"\x02td_ignoreBOM")) || started;
     bool hasErr = false;
+    std::vector<uint8_t> all;
+    if (!pend.empty() || stream) {
+        all = pend;
+        if (ptr && len) all.insert(all.end(), ptr, ptr + len);
+        size_t keep = 0;
+        if (stream) {
+            // sondaki tamamlanmamis cok baytli diziyi sonraki cagriya birak
+            size_t n = all.size();
+            for (size_t back = 1; back <= 3 && back <= n; back++) {
+                uint8_t b = all[n - back];
+                if ((b & 0xC0) == 0x80) continue;          // devam bayti
+                size_t need = (b & 0xE0) == 0xC0 ? 2 : (b & 0xF0) == 0xE0 ? 3 : (b & 0xF8) == 0xF0 ? 4 : 1;
+                if (need > back) keep = back;
+                break;
+            }
+        }
+        std::wstring ps;
+        for (size_t i = all.size() - keep; i < all.size(); i++) ps += wchar_t(all[i]);
+        if (thisV.IsObj()) {
+            rt.DefineData(thisV.o, L"\x02td_pend", Value::S(ps), false);
+            rt.DefineData(thisV.o, L"\x02td_started", Value::B(stream), false);
+        }
+        all.resize(all.size() - keep);
+        ptr = all.data();
+        len = all.size();
+    } else if (thisV.IsObj() && started) {
+        rt.DefineData(thisV.o, L"\x02td_started", Value::B(false), false);
+    }
     std::wstring res = (ptr && len > 0) ? FromUtf8(ptr, len, ignoreBOM, fatal, &hasErr) : L"";
     if (hasErr) {
         rt.Throw(L"TypeError", L"The encoded data was not valid utf-8");
